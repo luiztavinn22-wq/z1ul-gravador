@@ -1,0 +1,15 @@
+Z1UL GRAVADOR - como gerar o Z1UL_Setup.exe (sem instalar nada no PC)
+
+1. Crie uma conta gratis em github.com
+2. Clique em "+" > "New repository". Nome: z1ul-gravador. Marque "Public".
+   Clique em "Create repository".
+3. Na pagina do repositorio, clique em "uploading an existing file" e arraste
+   TODOS os arquivos e a pasta .github desta pasta. Clique em "Commit changes".
+4. Abra a aba "Actions" e espere o circulo amarelo ficar verde (5 a 10 min).
+5. Abra "Releases" (lado direito da pagina inicial). La esta o Z1UL_Setup.exe.
+
+O link para enviar a qualquer pessoa sempre baixa a versao mais nova:
+https://github.com/SEU_USUARIO/z1ul-gravador/releases/latest/download/Z1UL_Setup.exe
+
+Toda vez que voce alterar um arquivo no GitHub, uma versao nova e gerada.
+Rodar o Z1UL_Setup.exe de novo atualiza o app.

@@ -15,6 +15,7 @@ import math
 import time
 import queue
 import shutil
+import socket
 import tempfile
 import threading
 import subprocess
@@ -33,7 +34,7 @@ except ImportError:
     winsound = None
 
 APP_NOME = "Z1UL GRAVADOR"
-VERSAO = "1.1.0"
+VERSAO = "1.2.0"
 
 # ------------------------------------------------------------------ cores
 PRETO = "#03050A"
@@ -70,9 +71,11 @@ ENCODERS = {
 }
 NOME_ENCODER = {v: k for k, v in ENCODERS.items() if v}
 QUALIDADES = {"Leve": 28, "Média": 24, "Alta": 21, "Ultra": 18}
-RESOLUCOES = {"Igual à captura": None, "1280x720": (1280, 720), "1600x900": (1600, 900),
+RESOLUCOES = {"Igual ao jogo": None, "1280x720": (1280, 720), "1600x900": (1600, 900),
               "1920x1080": (1920, 1080), "2560x1440": (2560, 1440), "3840x2160": (3840, 2160)}
 MODOS = ["Jogo", "Janela", "Tela inteira"]
+AJUSTES = ["Preencher", "Esticar", "Encaixar"]
+PADRAO_AUDIO = "Padrão do Windows"
 PREV_W, PREV_H = 640, 360
 MONITORES = ["Monitor 1", "Monitor 2", "Monitor 3", "Monitor 4"]
 SEM_DISPOSITIVO = "Nenhum dispositivo encontrado"
@@ -81,6 +84,7 @@ PADRAO = {
     "duracao": 30, "fps": "60", "monitor": "Monitor 1", "cursor": True,
     "resolucao": "1920x1080", "qualidade": "Alta", "encoder": "Automático",
     "modo_captura": "Jogo", "janela_alvo": "", "janela_exe": "", "previa": True,
+    "ajuste": "Preencher", "virar": False,
     "perfil": "Nenhum",
     "f_cor": False, "brilho": 0.0, "contraste": 1.0, "saturacao": 1.0, "gama": 1.0,
     "f_vibrancia": False, "vibrancia": 0.3,
@@ -88,8 +92,8 @@ PADRAO = {
     "f_ruido": False, "ruido": 4.0,
     "f_pb": False,
     "f_vinheta": False, "vinheta": 0.5,
-    "sistema_on": True, "sistema_disp": "", "vol_sistema": 100,
-    "mic_on": True, "mic_disp": "", "vol_mic": 100, "mic_ruido": True,
+    "sistema_on": True, "sistema_disp": PADRAO_AUDIO, "vol_sistema": 100,
+    "mic_on": True, "mic_disp": PADRAO_AUDIO, "vol_mic": 100, "mic_ruido": True,
     "bitrate_audio": "160k",
     "tecla_salvar": "alt+f10", "tecla_buffer": "alt+f9",
     "som_salvar": True, "iniciar_auto": False,
@@ -97,7 +101,7 @@ PADRAO = {
 }
 
 OPCOES_VALIDAS = {
-    "fps": ["30", "60", "120"], "monitor": MONITORES, "modo_captura": MODOS, "resolucao": list(RESOLUCOES),
+    "fps": ["30", "60", "120"], "monitor": MONITORES, "modo_captura": MODOS, "ajuste": AJUSTES, "resolucao": list(RESOLUCOES),
     "qualidade": list(QUALIDADES), "encoder": list(ENCODERS),
     "bitrate_audio": ["128k", "160k", "192k", "320k"],
 }
@@ -118,7 +122,7 @@ PERFIS = {
 
 # mudanças nessas chaves não exigem reiniciar o buffer
 NAO_REINICIA = {"tecla_salvar", "tecla_buffer", "som_salvar", "iniciar_auto", "pasta", "perfil",
-                "modo_captura", "janela_alvo", "janela_exe", "monitor"}
+                "modo_captura", "janela_alvo", "janela_exe", "monitor", "previa"}
 
 
 # ================================================================== utilidades
@@ -187,29 +191,36 @@ def detectar_encoders(ffmpeg):
     return ok
 
 
-def listar_audio(ffmpeg):
-    r = rodar([ffmpeg, "-hide_banner", "-nostdin", "-list_devices", "true",
-               "-f", "dshow", "-i", "dummy"])
-    txt = r.stderr.decode("utf-8", errors="replace")
-    nomes = re.findall(r'"([^"]+)"\s*\(audio\)', txt)
-    if not nomes:  # formato antigo do FFmpeg
-        secao = False
-        for linha in txt.splitlines():
-            if "DirectShow audio devices" in linha:
-                secao = True
-                continue
-            if secao and "Alternative name" not in linha:
-                m = re.search(r'"([^"]+)"', linha)
-                if m:
-                    nomes.append(m.group(1))
-    return list(dict.fromkeys(nomes))
+def iniciar_com():
+    if os.name == "nt":
+        try:
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
+        except Exception:
+            pass
 
 
-def adivinhar(lista, chaves, evitar=None):
-    for n in lista:
-        if n != evitar and any(c in n.lower() for c in chaves):
-            return n
-    return ""
+def listar_audio():
+    """Lista saídas (fones/caixas) e microfones. Chamar fora da thread da interface."""
+    iniciar_com()
+    try:
+        import soundcard as sc
+        saidas = [d.name for d in sc.all_speakers()]
+        entradas = [d.name for d in sc.all_microphones()]
+        return saidas, entradas
+    except Exception:
+        return [], []
+
+
+def tem_gfxcapture(ffmpeg):
+    r = rodar([ffmpeg, "-hide_banner", "-nostdin", "-h", "filter=gfxcapture"])
+    texto = (r.stdout + r.stderr).decode("utf-8", "replace")
+    return r.returncode == 0 and "Unknown filter" not in texto and "gfxcapture" in texto
+
+
+def porta_livre():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_:
+        s_.bind(("127.0.0.1", 0))
+        return s_.getsockname()[1]
 
 
 def fmt_dur(v):
@@ -432,21 +443,55 @@ def calcular_regiao(i):
 
 
 def chave_regiao(r):
-    return None if r is None else (r["monitor"], r["x"], r["y"], r["w"], r["h"])
+    if r is None:
+        return None
+    if r["tipo"] == "janela":
+        return ("janela", r["hwnd"], r["w"], r["h"])
+    if r["tipo"] == "monitor":
+        return ("monitor", r["monitor"])
+    return ("regiao", r["monitor"], r["x"], r["y"], r["w"], r["h"])
+
+
+def janela_existe(hwnd):
+    return bool(NO_WINDOWS and hwnd and user32.IsWindow(hwnd))
 
 
 # ================================================================== FFmpeg
-def filtro_video(cfg, regiao, previa):
-    fonte = (f"ddagrab=output_idx={regiao['monitor']}:framerate={int(cfg['fps'])}"
-             f":draw_mouse={1 if cfg['cursor'] else 0}")
-    if regiao["w"]:
-        fonte += (f":video_size={regiao['w']}x{regiao['h']}"
-                  f":offset_x={regiao['x']}:offset_y={regiao['y']}")
-    f = [fonte, "hwdownload", "format=bgra"]
+def texto_fonte(cfg, fonte):
+    fps = int(cfg["fps"])
+    cursor = 1 if cfg["cursor"] else 0
+    if fonte["tipo"] == "regiao":  # plano B (FFmpeg sem gfxcapture)
+        s_ = f"ddagrab=output_idx={fonte['monitor']}:framerate={fps}:draw_mouse={cursor}"
+        if fonte["w"]:
+            s_ += (f":video_size={fonte['w']}x{fonte['h']}"
+                   f":offset_x={fonte['x']}:offset_y={fonte['y']}")
+        return s_
+    # Windows Graphics Capture: grava só a janela do jogo, mesmo com outras janelas por cima
+    s_ = f"gfxcapture=max_framerate={fps}:capture_cursor={cursor}"
+    if fonte["tipo"] == "janela":
+        s_ += f":hwnd={int(fonte['hwnd'])}"
+    else:
+        s_ += f":monitor_idx={int(fonte['monitor'])}"
+    return s_
+
+
+def filtro_video(cfg, fonte):
+    f = [texto_fonte(cfg, fonte), "hwdownload", "format=bgra"]
     tamanho = RESOLUCOES.get(cfg["resolucao"])
     if tamanho:
-        f.append(f"scale={tamanho[0]}:{tamanho[1]}:force_original_aspect_ratio=decrease"
-                 f":force_divisible_by=2:flags=lanczos")
+        w, h = tamanho
+        if cfg["ajuste"] == "Esticar":
+            f.append(f"scale={w}:{h}:flags=lanczos")
+        elif cfg["ajuste"] == "Encaixar":
+            f.append(f"scale={w}:{h}:force_original_aspect_ratio=decrease"
+                     f":force_divisible_by=2:flags=lanczos")
+        else:  # Preencher: ocupa a tela toda, sem faixas pretas (corta as sobras)
+            f.append(f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos")
+            f.append(f"crop={w}:{h}")
+    else:
+        f.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+    if cfg["virar"]:
+        f.append("vflip")
     if cfg["f_cor"]:
         f.append(f"eq=brightness={cfg['brilho']:.2f}:contrast={cfg['contraste']:.2f}"
                  f":saturation={cfg['saturacao']:.2f}:gamma={cfg['gama']:.2f}")
@@ -455,19 +500,16 @@ def filtro_video(cfg, regiao, previa):
     if cfg["f_nitidez"]:
         f.append(f"unsharp=5:5:{cfg['nitidez']:.2f}:5:5:0")
     if cfg["f_ruido"]:
-        s = float(cfg["ruido"])
-        f.append(f"hqdn3d={s / 2:.1f}:{s / 2:.1f}:{s:.1f}:{s:.1f}")
+        s_ = float(cfg["ruido"])
+        f.append(f"hqdn3d={s_ / 2:.1f}:{s_ / 2:.1f}:{s_:.1f}:{s_:.1f}")
     if cfg["f_pb"]:
         f.append("hue=s=0")
     if cfg["f_vinheta"]:
         f.append(f"vignette=angle={cfg['vinheta']:.2f}")
-    if tamanho:  # sempre em paisagem: faixas pretas se o jogo tiver outro formato
+    if tamanho and cfg["ajuste"] == "Encaixar":
         f.append(f"pad={tamanho[0]}:{tamanho[1]}:(ow-iw)/2:(oh-ih)/2:color=black")
     f += ["setsar=1", "format=yuv420p"]
-    cadeia = ",".join(f)
-    if not previa:
-        return cadeia + "[v]"
-    return (cadeia + ",split=2[v][pv];"
+    return (",".join(f) + ",split=2[v][pv];"
             f"[pv]fps=10,scale={PREV_W}:{PREV_H}:force_original_aspect_ratio=decrease,"
             f"pad={PREV_W}:{PREV_H}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24[prev]")
 
@@ -487,24 +529,17 @@ def args_encoder(enc, qp, fps):
     return a + ["-g", str(fps)]
 
 
-def dispositivo_valido(nome):
-    return bool(nome) and nome != SEM_DISPOSITIVO
-
-
-def montar_comando(ffmpeg, cfg, encoder, regiao):
+def montar_comando(ffmpeg, cfg, encoder, fonte, portas):
+    """portas: [(tipo, porta)] - o áudio chega do próprio app por conexões locais."""
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
-    entradas = []
-    if cfg["sistema_on"] and dispositivo_valido(cfg["sistema_disp"]):
-        entradas.append(("sistema", cfg["sistema_disp"]))
-    if cfg["mic_on"] and dispositivo_valido(cfg["mic_disp"]) and cfg["mic_disp"] != cfg["sistema_disp"]:
-        entradas.append(("mic", cfg["mic_disp"]))
-    for _, disp in entradas:
-        cmd += ["-f", "dshow", "-thread_queue_size", "1024", "-rtbufsize", "150M",
-                "-i", f"audio={disp}"]
+    for _, porta in portas:
+        cmd += ["-f", "f32le", "-ar", "48000", "-ac", "2", "-probesize", "32",
+                "-analyzeduration", "0", "-thread_queue_size", "1024",
+                "-i", f"tcp://127.0.0.1:{porta}?listen=1&listen_timeout=20000"]
 
-    partes = [filtro_video(cfg, regiao, cfg["previa"])]
+    partes = [filtro_video(cfg, fonte)]
     rotulos = []
-    for i, (tipo, _) in enumerate(entradas):
+    for i, (tipo, _) in enumerate(portas):
         if tipo == "sistema":
             cadeia = f"volume={cfg['vol_sistema'] / 100:.2f}"
         else:
@@ -529,12 +564,134 @@ def montar_comando(ffmpeg, cfg, encoder, regiao):
         cmd += ["-c:a", "aac", "-b:a", cfg["bitrate_audio"], "-ar", "48000"]
 
     voltas = math.ceil(int(cfg["duracao"]) / SEG) + 6
-    cmd += ["-f", "segment", "-segment_time", str(SEG), "-segment_wrap", str(voltas),
+    cmd += ["-max_interleave_delta", "1000000",
+            "-f", "segment", "-segment_time", str(SEG), "-segment_wrap", str(voltas),
             "-segment_format", "mpegts", "-reset_timestamps", "1",
             os.path.join(PASTA_BUFFER, "seg%03d.ts")]
-    if cfg["previa"]:
-        cmd += ["-map", "[prev]", "-c:v", "rawvideo", "-f", "rawvideo", "pipe:1"]
+    cmd += ["-map", "[prev]", "-c:v", "rawvideo", "-f", "rawvideo", "pipe:1"]
     return cmd
+
+
+class BombaAudio:
+    """Captura o som (do Windows ou do microfone) e entrega ao FFmpeg no ritmo do relógio.
+    Quando não há som tocando, envia silêncio, para o áudio nunca sair de sincronia."""
+    TAXA = 48000
+    BYTES = 8           # 2 canais x float32
+    PREFIXO = 2048      # silêncio inicial para o FFmpeg reconhecer o formato
+    MAXIMO = TAXA * BYTES // 4  # no máximo 0,25 s guardado
+
+    def __init__(self, tipo, dispositivo, porta, video_iniciou, eventos):
+        self.tipo = tipo
+        self.dispositivo = dispositivo
+        self.porta = porta
+        self.video_iniciou = video_iniciou
+        self.eventos = eventos
+        self.parar_ev = threading.Event()
+        self.fila = deque()
+        self.tamanho = 0
+        self.trava = threading.Lock()
+        self.sock = None
+
+    def iniciar(self):
+        threading.Thread(target=self._capturar, daemon=True).start()
+        threading.Thread(target=self._enviar, daemon=True).start()
+
+    def parar(self):
+        self.parar_ev.set()
+        try:
+            if self.sock:
+                self.sock.close()
+        except OSError:
+            pass
+
+    def _abrir(self):
+        import soundcard as sc
+        escolhido = self.dispositivo if self.dispositivo not in ("", PADRAO_AUDIO) else None
+        if self.tipo == "sistema":
+            saida = None
+            if escolhido:
+                saida = next((d for d in sc.all_speakers() if d.name == escolhido), None)
+            saida = saida or sc.default_speaker()
+            return sc.get_microphone(id=str(saida.name), include_loopback=True), 2
+        mic = None
+        if escolhido:
+            mic = next((d for d in sc.all_microphones() if d.name == escolhido), None)
+        return (mic or sc.default_microphone()), 1
+
+    def _capturar(self):
+        iniciar_com()
+        try:
+            import numpy as np
+            dispositivo, canais = self._abrir()
+            with dispositivo.recorder(samplerate=self.TAXA, channels=canais, blocksize=1024) as rec:
+                while not self.parar_ev.is_set():
+                    dados = rec.record(numframes=480)
+                    if dados.ndim == 1:
+                        dados = dados[:, None]
+                    if dados.shape[1] == 1:
+                        dados = np.repeat(dados, 2, axis=1)
+                    elif dados.shape[1] > 2:
+                        dados = dados[:, :2]
+                    bloco = np.ascontiguousarray(dados, dtype="<f4").tobytes()
+                    with self.trava:
+                        self.fila.append(bloco)
+                        self.tamanho += len(bloco)
+                        while self.tamanho > self.MAXIMO and self.fila:
+                            self.tamanho -= len(self.fila.popleft())
+        except Exception as e:
+            if not self.parar_ev.is_set():
+                nome = "Som do jogo" if self.tipo == "sistema" else "Microfone"
+                self.eventos.put(("aviso_audio", f"{nome} indisponível: {e}"))
+
+    def _enviar(self):
+        limite = time.time() + 20
+        while not self.parar_ev.is_set() and time.time() < limite:
+            try:
+                self.sock = socket.create_connection(("127.0.0.1", self.porta), timeout=1)
+                break
+            except OSError:
+                time.sleep(0.1)
+        if not self.sock:
+            return
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock.settimeout(None)
+            self.sock.sendall(bytes(self.PREFIXO * self.BYTES))
+            # espera o vídeo começar, para som e imagem saírem juntos
+            self.video_iniciou.wait(3)
+            with self.trava:
+                self.fila.clear()
+                self.tamanho = 0
+            inicio = time.perf_counter()
+            enviados = 0
+            resto = b""
+            while not self.parar_ev.is_set():
+                falta = int((time.perf_counter() - inicio) * self.TAXA) - enviados
+                if falta < 240:
+                    time.sleep(0.004)
+                    continue
+                precisa = falta * self.BYTES
+                partes, obtido = [resto], len(resto)
+                with self.trava:
+                    while obtido < precisa and self.fila:
+                        b = self.fila.popleft()
+                        self.tamanho -= len(b)
+                        partes.append(b)
+                        obtido += len(b)
+                dados = b"".join(partes)
+                if len(dados) >= precisa:
+                    bloco, resto = dados[:precisa], dados[precisa:]
+                else:
+                    bloco, resto = dados + bytes(precisa - len(dados)), b""
+                self.sock.sendall(bloco)
+                enviados += falta
+        except OSError:
+            pass
+        finally:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
 
 
 class Gravador:
@@ -551,31 +708,45 @@ class Gravador:
         self.regiao = None
         self.quadro = None
         self.quadro_n = 0
+        self.bombas = []
+        self.video_iniciou = threading.Event()
 
     @property
     def ativo(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def iniciar(self, cfg, encoder, regiao):
+    def iniciar(self, cfg, encoder, fonte):
         if self.ativo:
             return
         self.cfg = dict(cfg)
         self.encoder = encoder
-        self.regiao = regiao
+        self.regiao = fonte
         self.quadro = None
         shutil.rmtree(PASTA_BUFFER, ignore_errors=True)
         os.makedirs(PASTA_BUFFER, exist_ok=True)
         self.log.clear()
         self.parando = False
+        self.video_iniciou = threading.Event()
+
+        portas = []
+        if self.cfg["sistema_on"]:
+            portas.append(("sistema", porta_livre()))
+        if self.cfg["mic_on"]:
+            portas.append(("mic", porta_livre()))
+
         self.proc = subprocess.Popen(
-            montar_comando(self.ffmpeg, self.cfg, encoder, regiao),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE if self.cfg["previa"] else subprocess.DEVNULL,
-            stderr=subprocess.PIPE, creationflags=SEM_JANELA)
+            montar_comando(self.ffmpeg, self.cfg, encoder, fonte, portas),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=SEM_JANELA)
         self.inicio = time.time()
+        self.bombas = []
+        for tipo, porta in portas:
+            disp = self.cfg["sistema_disp"] if tipo == "sistema" else self.cfg["mic_disp"]
+            bomba = BombaAudio(tipo, disp, porta, self.video_iniciou, self.eventos)
+            bomba.iniciar()
+            self.bombas.append(bomba)
         threading.Thread(target=self._vigiar, args=(self.proc,), daemon=True).start()
-        if self.cfg["previa"]:
-            threading.Thread(target=self._ler_previa, args=(self.proc,), daemon=True).start()
+        threading.Thread(target=self._ler_previa, args=(self.proc,), daemon=True).start()
 
     def _ler_previa(self, proc):
         tamanho = PREV_W * PREV_H * 3
@@ -585,11 +756,14 @@ class Gravador:
                 break
             self.quadro = dados
             self.quadro_n += 1
+            self.video_iniciou.set()
 
     def _vigiar(self, proc):
         for linha in proc.stderr:
             self.log.append(linha.decode("utf-8", errors="replace").rstrip())
         proc.wait()
+        for b in self.bombas:
+            b.parar()
         if not self.parando:
             detalhes = "\n".join(list(self.log)[-8:]) or f"Código de saída {proc.returncode}."
             self.eventos.put(("caiu", detalhes))
@@ -609,6 +783,9 @@ class Gravador:
                 proc.kill()
             except Exception:
                 pass
+        for b in self.bombas:
+            b.parar()
+        self.bombas = []
         self.proc = None
         shutil.rmtree(PASTA_BUFFER, ignore_errors=True)
 
@@ -687,6 +864,8 @@ class App(ctk.CTk):
         self.mapa_janelas = {}
         self.foto = None
         self.ultimo_quadro = -1
+        self.usar_wgc = True
+        self.avisou_audio = False
 
         self.title(APP_NOME)
         self.geometry("1200x780")
@@ -1013,22 +1192,31 @@ class App(ctk.CTk):
                     self._segmentos("fps", ["30", "60", "120"]))
         self._linha(c, "Mostrar o cursor", "Desligue em jogos de tiro para o vídeo ficar limpo.",
                     self._switch("cursor"))
-        self._linha(c, "Prévia no Painel", "Mostra ao vivo o que está sendo gravado. Desligue "
-                                           "para economizar um pouco de desempenho.",
+        self._linha(c, "Prévia no Painel", "Mostra ao vivo o que está sendo gravado.",
                     self._switch("previa"))
         ctk.CTkLabel(c, text="No modo Jogo, o Z1UL reconhece FiveM, GTA V, emuladores de Free Fire "
                              "(BlueStacks, MSI App Player, LDPlayer, Gameloop), Valorant, CS2, "
-                             "Fortnite, Roblox e qualquer jogo aberto em tela cheia. Se você der "
-                             "Alt + Tab, a área onde o jogo estava continua sendo gravada.",
+                             "Fortnite, Roblox e qualquer jogo aberto em tela cheia, e grava só a "
+                             "janela do jogo, mesmo com outras janelas por cima. Ao minimizar, "
+                             "o Windows para de desenhar o jogo: o vídeo congela na última imagem "
+                             "e o som continua. Para não congelar, use o modo Sem bordas "
+                             "(Borderless) no jogo e troque de janela sem minimizar.",
                      font=F(12), text_color=AZUL_CLARO, anchor="w", justify="left",
                      wraplength=700).pack(fill="x", padx=24, pady=(6, 0))
         self._fim_cartao(c)
 
         c = self._cartao(p, "Qualidade da imagem")
         self._linha(c, "Resolução da gravação", "Tamanho final do vídeo, sempre em paisagem "
-                                                "(16:9). Se o jogo tiver outro formato, aparecem "
-                                                "faixas pretas nas laterais, como no OBS.",
+                                                "(16:9).",
                     self._opcoes("resolucao", list(RESOLUCOES)))
+        self._linha(c, "Ajuste da imagem", "Preencher ocupa o vídeo todo sem faixas pretas "
+                                           "(corta um pouco das bordas se o formato for "
+                                           "diferente). Esticar deforma para caber. Encaixar "
+                                           "mostra tudo, com faixas pretas.",
+                    self._segmentos("ajuste", AJUSTES))
+        self._linha(c, "Imagem de cabeça para baixo?", "Ligue só se o vídeo sair invertido "
+                                                       "no seu PC.",
+                    self._switch("virar"))
         self._linha(c, "Qualidade", "Ultra preserva mais detalhes, mas o arquivo fica bem maior.",
                     self._segmentos("qualidade", list(QUALIDADES)))
         self.menu_encoder = self._linha(
@@ -1099,12 +1287,13 @@ class App(ctk.CTk):
 
     def _pagina_audio(self):
         p = self._nova_pagina("audio", "Áudio", "Som do jogo e do microfone, cada um com seu volume.")
-        inicial = [self.cfg["sistema_disp"] or "Carregando…"]
+        inicial = [self.cfg["sistema_disp"] or PADRAO_AUDIO]
 
         c = self._cartao(p, "Som do jogo", "Captura tudo que sai pelos seus fones ou caixas de som.",
                          direita=self._switch("sistema_on"))
         self.menu_sistema = self._linha(
-            c, "Dispositivo", "Escolha \"Mixagem estéreo\" ou \"CABLE Output\".",
+            c, "Onde você ouve o jogo", "Fone ou caixa de som. Padrão do Windows funciona "
+                                        "para a maioria. Não precisa de Mixagem estéreo.",
             self._opcoes("sistema_disp", inicial, largura=320))
         self._linha(c, "Volume", None, self._slider("vol_sistema", 0, 200, 40,
                                                     lambda v: f"{int(v)}%", tipo="int"))
@@ -1113,7 +1302,7 @@ class App(ctk.CTk):
         c = self._cartao(p, "Microfone", "Sua voz junto com o jogo.",
                          direita=self._switch("mic_on"))
         self.menu_mic = self._linha(c, "Dispositivo", None,
-                                    self._opcoes("mic_disp", [self.cfg["mic_disp"] or "Carregando…"],
+                                    self._opcoes("mic_disp", [self.cfg["mic_disp"] or PADRAO_AUDIO],
                                                  largura=320))
         self._linha(c, "Volume", None, self._slider("vol_mic", 0, 200, 40,
                                                     lambda v: f"{int(v)}%", tipo="int"))
@@ -1128,11 +1317,6 @@ class App(ctk.CTk):
                                                 "depois de abrir o app.",
                     lambda pai: self._botao(pai, "Procurar de novo", self.recarregar_dispositivos,
                                             largura=160))
-        ctk.CTkLabel(c, text="Não aparece \"Mixagem estéreo\"? Abra Painel de Controle > Som > "
-                             "Gravação, clique com o botão direito, marque \"Mostrar dispositivos "
-                             "desativados\" e ative. Se não existir no seu PC, instale o VB-Cable.",
-                     font=F(12), text_color=AZUL_CLARO, anchor="w", justify="left",
-                     wraplength=700).pack(fill="x", padx=24, pady=(6, 0))
         self._fim_cartao(c)
 
     def _pagina_atalhos(self):
@@ -1304,14 +1488,15 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ detecção
     def _detectar(self):
+        self.eventos.put(("gfxcapture", tem_gfxcapture(self.ffmpeg)))
         self.eventos.put(("encoders", detectar_encoders(self.ffmpeg)))
-        self.eventos.put(("dispositivos", listar_audio(self.ffmpeg)))
+        self.eventos.put(("dispositivos", listar_audio()))
         self.eventos.put(("pronto",))
 
     def recarregar_dispositivos(self):
         if self.ffmpeg:
             threading.Thread(target=lambda: self.eventos.put(
-                ("dispositivos", listar_audio(self.ffmpeg))), daemon=True).start()
+                ("dispositivos", listar_audio())), daemon=True).start()
             self.toast("Procurando dispositivos de áudio…")
 
     def _receber_encoders(self, lista):
@@ -1322,21 +1507,14 @@ class App(ctk.CTk):
             self.vars["encoder"].set("Automático")
         self.atualizar_resumo()
 
-    def _receber_dispositivos(self, lista):
-        self.dispositivos = lista
-        valores = lista or [SEM_DISPOSITIVO]
-        self.menu_sistema.configure(values=valores)
-        self.menu_mic.configure(values=valores)
-        if self.cfg["sistema_disp"] not in lista:
-            palpite = adivinhar(lista, ["estéreo", "estereo", "stereo", "mix", "cable output",
-                                        "what u hear", "virtual-audio"])
-            self.vars["sistema_disp"].set(palpite or SEM_DISPOSITIVO)
-        if self.cfg["mic_disp"] not in lista:
-            palpite = adivinhar(lista, ["micro", "mic", "headset", "fone"],
-                                evitar=self.cfg["sistema_disp"])
-            if not palpite:
-                palpite = next((n for n in lista if n != self.cfg["sistema_disp"]), "")
-            self.vars["mic_disp"].set(palpite or SEM_DISPOSITIVO)
+    def _receber_dispositivos(self, listas):
+        saidas, entradas = listas
+        self.menu_sistema.configure(values=[PADRAO_AUDIO] + saidas)
+        self.menu_mic.configure(values=[PADRAO_AUDIO] + entradas)
+        if self.cfg["sistema_disp"] not in saidas:
+            self.vars["sistema_disp"].set(PADRAO_AUDIO)
+        if self.cfg["mic_disp"] not in entradas:
+            self.vars["mic_disp"].set(PADRAO_AUDIO)
 
     def encoder_escolhido(self):
         escolhido = ENCODERS.get(self.cfg["encoder"])
@@ -1388,8 +1566,9 @@ class App(ctk.CTk):
         modo = self.cfg["modo_captura"]
         if modo == "Tela inteira":
             idx = MONITORES.index(self.cfg["monitor"]) if self.cfg["monitor"] in MONITORES else 0
-            return {"monitor": idx, "x": 0, "y": 0, "w": 0, "h": 0,
-                    "titulo": f"Tela inteira ({self.cfg['monitor']})", "hwnd": None}
+            return {"tipo": "monitor" if self.usar_wgc else "regiao", "monitor": idx,
+                    "x": 0, "y": 0, "w": 0, "h": 0, "hwnd": None,
+                    "titulo": f"Tela inteira ({self.cfg['monitor']})"}
         if modo == "Janela":
             info = achar_janela(self.cfg["janela_alvo"], self.cfg["janela_exe"])
         else:
@@ -1398,12 +1577,18 @@ class App(ctk.CTk):
         if not info:
             return None
         if info["minimizada"]:
-            # jogo minimizado (Alt + Tab): continua gravando a mesma área
+            # minimizado: continua a mesma gravação (o vídeo congela, o som segue)
             atual = self.regiao_atual
             if self.gravador.ativo and atual and atual.get("hwnd") == info["hwnd"]:
                 return atual
             return None
-        return calcular_regiao(info)
+        if self.usar_wgc:
+            return {"tipo": "janela", "hwnd": info["hwnd"], "w": info["w"], "h": info["h"],
+                    "titulo": info["titulo"] or info["exe"]}
+        regiao = calcular_regiao(info)
+        if regiao:
+            regiao["tipo"] = "regiao"
+        return regiao
 
     def _vigia(self):
         try:
@@ -1438,6 +1623,7 @@ class App(ctk.CTk):
             self.candidato = None
 
     def _iniciar_captura(self, regiao):
+        self.avisou_audio = False
         try:
             self.gravador.iniciar(self.cfg, self.encoder_escolhido(), regiao)
         except Exception as e:
@@ -1465,12 +1651,13 @@ class App(ctk.CTk):
     def _atualizar_previa(self):
         g = self.gravador
         try:
-            if g and g.ativo and g.quadro is not None and g.quadro_n != self.ultimo_quadro:
+            if (self.cfg["previa"] and g and g.ativo and g.quadro is not None
+                    and g.quadro_n != self.ultimo_quadro):
                 self.ultimo_quadro = g.quadro_n
                 cabecalho = f"P6 {PREV_W} {PREV_H} 255\n".encode()
                 self.foto = tk.PhotoImage(data=cabecalho + g.quadro, format="ppm")
                 self.tela_previa.configure(image=self.foto, text="")
-            elif not (g and g.ativo) and self.foto is not None:
+            elif (not (g and g.ativo) or not self.cfg["previa"]) and self.foto is not None:
                 self.foto = None
                 self.tela_previa.configure(image="", text=self._texto_previa())
         except Exception:
@@ -1703,7 +1890,13 @@ class App(ctk.CTk):
                     else:
                         self.toast("Buffer desligado.")
                 elif nome == "caiu":
+                    anterior = self.regiao_atual or {}
                     self.regiao_atual = None
+                    if anterior.get("hwnd") and not janela_existe(anterior["hwnd"]):
+                        self.alvo_hwnd = None
+                        self._atualizar_estado()
+                        self.toast("O jogo foi fechado. Aguardando o próximo.")
+                        continue
                     agora = time.time()
                     self.falhas = [t for t in self.falhas if agora - t < 60] + [agora]
                     if self.armado and len(self.falhas) < 3:
@@ -1718,6 +1911,12 @@ class App(ctk.CTk):
                           "dispositivo de áudio.")
                 elif nome == "encoders":
                     self._receber_encoders(ev[1])
+                elif nome == "gfxcapture":
+                    self.usar_wgc = ev[1]
+                elif nome == "aviso_audio":
+                    if not self.avisou_audio:
+                        self.avisou_audio = True
+                        self.toast(ev[1], "erro")
                 elif nome == "dispositivos":
                     self._receber_dispositivos(ev[1])
                 elif nome == "tecla":

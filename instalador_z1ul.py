@@ -9,6 +9,8 @@ Com o argumento --desinstalar, remove o app (usado pelo Painel de Controle).
 """
 
 import os
+import re
+import ssl
 import sys
 import time
 import queue
@@ -66,10 +68,44 @@ class Cancelado(Exception):
     pass
 
 
-def baixar_texto(url):
+def contexto_ssl():
+    ctx = ssl.create_default_context()  # já inclui os certificados do Windows
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
+SSL = contexto_ssl()
+
+
+def abrir_url(url, timeout=30):
     req = urllib.request.Request(url, headers={"User-Agent": "Z1UL-Setup"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return r.read().decode("utf-8-sig").strip()
+    return urllib.request.urlopen(req, timeout=timeout, context=SSL)
+
+
+def curl(*args, timeout=120):
+    return subprocess.run(["curl.exe", *args], capture_output=True, stdin=subprocess.DEVNULL,
+                          creationflags=SEM_JANELA, timeout=timeout)
+
+
+def baixar_texto(url):
+    erros = []
+    try:
+        with abrir_url(url, timeout=20) as r:
+            return r.read().decode("utf-8-sig").strip()
+    except Exception as e:
+        erros.append(f"Python: {e}")
+    try:
+        r = curl("-fsSL", "--retry", "2", url, timeout=60)
+        if r.returncode == 0:
+            return r.stdout.decode("utf-8-sig").strip()
+        erros.append(f"curl: {r.stderr.decode('utf-8', 'replace').strip()}")
+    except Exception as e:
+        erros.append(f"curl: {e}")
+    raise RuntimeError(" | ".join(erros))
 
 
 def powershell(script):
@@ -208,7 +244,7 @@ class Splash(tk.Tk):
                                    font=("Segoe UI Semibold", 12))
         self.lbl_status.pack(fill="x")
         self.lbl_detalhe = tk.Label(base, text="", bg=PRETO, fg=APAGADO, anchor="w", justify="left",
-                                    font=("Segoe UI", 10), wraplength=self.S(470))
+                                    font=("Segoe UI", 9), wraplength=self.S(470))
         self.lbl_detalhe.pack(fill="x", pady=(self.S(2), self.S(12)))
         self.barra = tk.Canvas(base, height=self.S(6), bg=PRETO, highlightthickness=0)
         self.barra.pack(fill="x")
@@ -314,9 +350,31 @@ class Splash(tk.Tk):
         self.cancelado = True
         self.destroy()
 
+    def _progresso(self, feito, total, inicio):
+        vel = feito / max(time.time() - inicio, 0.1) / 1048576
+        if total:
+            frac = min(feito / total, 1.0)
+            self.estado(f"Baixando Z1UL GRAVADOR… {int(frac * 100)}%",
+                        f"{feito / 1048576:.1f} de {total / 1048576:.1f} MB, {vel:.1f} MB/s", frac)
+        else:
+            self.estado("Baixando Z1UL GRAVADOR…", f"{feito / 1048576:.1f} MB, {vel:.1f} MB/s")
+
     def _baixar(self, url, destino):
-        req = urllib.request.Request(url, headers={"User-Agent": "Z1UL-Setup"})
-        with urllib.request.urlopen(req, timeout=30) as r, open(destino, "wb") as f:
+        try:
+            self._baixar_python(url, destino)
+        except Cancelado:
+            raise
+        except Exception as e:
+            erro_python = e
+            try:
+                self._baixar_curl(url, destino)
+            except Cancelado:
+                raise
+            except Exception as e2:
+                raise RuntimeError(f"Falha no download. Python: {erro_python} | curl: {e2}")
+
+    def _baixar_python(self, url, destino):
+        with abrir_url(url) as r, open(destino, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             feito, inicio, ultimo = 0, time.time(), 0.0
             while True:
@@ -327,18 +385,35 @@ class Splash(tk.Tk):
                     break
                 f.write(bloco)
                 feito += len(bloco)
-                agora = time.time()
-                if agora - ultimo > 0.1:
-                    ultimo = agora
-                    vel = feito / max(agora - inicio, 0.1) / 1048576
-                    if total:
-                        frac = feito / total
-                        self.estado(f"Baixando Z1UL GRAVADOR… {int(frac * 100)}%",
-                                    f"{feito / 1048576:.1f} de {total / 1048576:.1f} MB, "
-                                    f"{vel:.1f} MB/s", frac)
-                    else:
-                        self.estado("Baixando Z1UL GRAVADOR…",
-                                    f"{feito / 1048576:.1f} MB, {vel:.1f} MB/s")
+                if time.time() - ultimo > 0.1:
+                    ultimo = time.time()
+                    self._progresso(feito, total, inicio)
+
+    def _baixar_curl(self, url, destino):
+        total = 0
+        try:
+            cab = curl("-sIL", url, timeout=30).stdout.decode("utf-8", "replace")
+            tamanhos = re.findall(r"content-length:\s*(\d+)", cab, re.I)
+            if tamanhos:
+                total = int(tamanhos[-1])
+        except Exception:
+            pass
+        if os.path.exists(destino):
+            os.remove(destino)
+        proc = subprocess.Popen(["curl.exe", "-fsSL", "--retry", "2", "-o", destino, url],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, creationflags=SEM_JANELA)
+        inicio = time.time()
+        while proc.poll() is None:
+            if self.cancelado:
+                proc.kill()
+                raise Cancelado()
+            feito = os.path.getsize(destino) if os.path.exists(destino) else 0
+            self._progresso(feito, total, inicio)
+            time.sleep(0.15)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.read().decode("utf-8", "replace").strip()
+                               or f"código {proc.returncode}")
 
     def _instalar(self):
         tmp = None
@@ -348,9 +423,8 @@ class Splash(tk.Tk):
             self.estado("Procurando a versão mais recente…")
             try:
                 versao = baixar_texto(URL_BASE + "versao.txt")
-            except Exception:
-                raise RuntimeError("Sem conexão com o servidor. Confira sua internet e "
-                                   "tente de novo.")
+            except Exception as e:
+                raise RuntimeError(f"Sem conexão com o servidor. Detalhe: {e}")
 
             tmp = tempfile.mkdtemp(prefix="z1ul_setup_")
             pacote = os.path.join(tmp, PACOTE)

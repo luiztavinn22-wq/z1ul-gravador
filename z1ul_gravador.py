@@ -33,7 +33,7 @@ except ImportError:
     winsound = None
 
 APP_NOME = "Z1UL GRAVADOR"
-VERSAO = "1.0.0"
+VERSAO = "1.1.0"
 
 # ------------------------------------------------------------------ cores
 PRETO = "#03050A"
@@ -70,13 +70,17 @@ ENCODERS = {
 }
 NOME_ENCODER = {v: k for k, v in ENCODERS.items() if v}
 QUALIDADES = {"Leve": 28, "Média": 24, "Alta": 21, "Ultra": 18}
-RESOLUCOES = {"Nativa": None, "1440p": 1440, "1080p": 1080, "900p": 900, "720p": 720}
+RESOLUCOES = {"Igual à captura": None, "1280x720": (1280, 720), "1600x900": (1600, 900),
+              "1920x1080": (1920, 1080), "2560x1440": (2560, 1440), "3840x2160": (3840, 2160)}
+MODOS = ["Jogo", "Janela", "Tela inteira"]
+PREV_W, PREV_H = 640, 360
 MONITORES = ["Monitor 1", "Monitor 2", "Monitor 3", "Monitor 4"]
 SEM_DISPOSITIVO = "Nenhum dispositivo encontrado"
 
 PADRAO = {
     "duracao": 30, "fps": "60", "monitor": "Monitor 1", "cursor": True,
-    "resolucao": "Nativa", "qualidade": "Alta", "encoder": "Automático",
+    "resolucao": "1920x1080", "qualidade": "Alta", "encoder": "Automático",
+    "modo_captura": "Jogo", "janela_alvo": "", "janela_exe": "", "previa": True,
     "perfil": "Nenhum",
     "f_cor": False, "brilho": 0.0, "contraste": 1.0, "saturacao": 1.0, "gama": 1.0,
     "f_vibrancia": False, "vibrancia": 0.3,
@@ -93,7 +97,7 @@ PADRAO = {
 }
 
 OPCOES_VALIDAS = {
-    "fps": ["30", "60", "120"], "monitor": MONITORES, "resolucao": list(RESOLUCOES),
+    "fps": ["30", "60", "120"], "monitor": MONITORES, "modo_captura": MODOS, "resolucao": list(RESOLUCOES),
     "qualidade": list(QUALIDADES), "encoder": list(ENCODERS),
     "bitrate_audio": ["128k", "160k", "192k", "320k"],
 }
@@ -113,7 +117,8 @@ PERFIS = {
 }
 
 # mudanças nessas chaves não exigem reiniciar o buffer
-NAO_REINICIA = {"tecla_salvar", "tecla_buffer", "som_salvar", "iniciar_auto", "pasta", "perfil"}
+NAO_REINICIA = {"tecla_salvar", "tecla_buffer", "som_salvar", "iniciar_auto", "pasta", "perfil",
+                "modo_captura", "janela_alvo", "janela_exe", "monitor"}
 
 
 # ================================================================== utilidades
@@ -228,15 +233,220 @@ def F(tamanho, negrito=False, titulo=False):
                        weight="bold" if negrito else "normal")
 
 
+# ================================================================== janelas e jogos
+NO_WINDOWS = os.name == "nt"
+if NO_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    dwmapi = ctypes.windll.dwmapi
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+                                         ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
+    user32.EnumDisplayMonitors.argtypes = [wintypes.HDC, ctypes.c_void_p, MONITORENUMPROC,
+                                           wintypes.LPARAM]
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p,
+                                             wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                     wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+# trechos do nome do processo de jogos conhecidos (FiveM, emuladores de Free Fire etc.)
+JOGOS_CONHECIDOS = (
+    "gtaprocess", "gta5", "gta5_enhanced", "ragemp", "altv",                 # GTA / FiveM
+    "hd-player", "bluestacks", "dnplayer", "ldplayer", "nox.exe", "memu",    # emuladores
+    "androidemulator", "aow_exe", "msi app player",
+    "valorant", "cs2.exe", "csgo", "fortniteclient", "robloxplayer", "r5apex",
+    "league of legends", "rocketleague", "overwatch", "eldenring", "rdr2",
+    "genshinimpact", "pubg", "tslgame", "cod.exe", "modernwarfare", "minecraft",
+    "fc24", "fc25", "fc26", "rainbowsix", "deadbydaylight", "warzone",
+)
+# programas que nunca são tratados como jogo, mesmo em tela cheia
+NUNCA_JOGO = (
+    "explorer.exe", "applicationframehost.exe", "textinputhost.exe", "searchhost.exe",
+    "shellexperiencehost.exe", "startmenuexperiencehost.exe", "lockapp.exe",
+    "systemsettings.exe", "z1ul gravador.exe", "z1ul_setup.exe", "chrome.exe", "msedge.exe",
+    "firefox.exe", "opera.exe", "brave.exe", "vlc.exe", "wmplayer.exe", "discord.exe",
+    "obs64.exe", "fivem.exe",
+)
+
+
+def nome_processo(pid):
+    h = kernel32.OpenProcess(0x1000, False, pid)
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(520)
+        tam = wintypes.DWORD(520)
+        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(tam)):
+            return os.path.basename(buf.value).lower()
+        return ""
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def info_janela(hwnd):
+    if not NO_WINDOWS or not hwnd or not user32.IsWindow(hwnd):
+        return None
+    n = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(n + 1)
+    user32.GetWindowTextW(hwnd, buf, n + 1)
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    r = wintypes.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(r))
+    ponto = wintypes.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(ponto))
+    return {"hwnd": hwnd, "titulo": buf.value, "pid": pid.value, "exe": nome_processo(pid.value),
+            "x": ponto.x, "y": ponto.y, "w": r.right, "h": r.bottom,
+            "minimizada": bool(user32.IsIconic(hwnd))}
+
+
+def janela_oculta(hwnd):
+    valor = ctypes.c_int(0)
+    dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(valor), ctypes.sizeof(valor))
+    return valor.value != 0
+
+
+def listar_janelas():
+    if not NO_WINDOWS:
+        return []
+    resultado = []
+    meu_pid = os.getpid()
+
+    def cb(hwnd, _):
+        try:
+            if (user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0
+                    and not janela_oculta(hwnd)
+                    and not user32.GetWindowLongW(hwnd, -20) & 0x80):
+                i = info_janela(hwnd)
+                if i and i["pid"] != meu_pid and i["exe"] not in NUNCA_JOGO[:8] and (
+                        i["minimizada"] or (i["w"] >= 320 and i["h"] >= 240)):
+                    resultado.append(i)
+        except Exception:
+            pass
+        return True
+    user32.EnumWindows(WNDENUMPROC(cb), 0)
+    return resultado
+
+
+def listar_monitores():
+    if not NO_WINDOWS:
+        return [{"x": 0, "y": 0, "w": 1920, "h": 1080, "primario": True}]
+    lista = []
+
+    def cb(hmon, hdc, prect, _):
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        user32.GetMonitorInfoW(hmon, ctypes.byref(info))
+        r = info.rcMonitor
+        lista.append({"x": r.left, "y": r.top, "w": r.right - r.left, "h": r.bottom - r.top,
+                      "primario": bool(info.dwFlags & 1)})
+        return True
+    user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(cb), 0)
+    lista.sort(key=lambda m: (not m["primario"], m["x"], m["y"]))
+    return lista or [{"x": 0, "y": 0, "w": 1920, "h": 1080, "primario": True}]
+
+
+def eh_jogo_conhecido(i):
+    exe = i["exe"]
+    return exe not in NUNCA_JOGO and any(j in exe for j in JOGOS_CONHECIDOS)
+
+
+def em_tela_cheia(i, monitores):
+    return any(i["x"] == m["x"] and i["y"] == m["y"] and i["w"] == m["w"] and i["h"] == m["h"]
+               for m in monitores)
+
+
+def achar_jogo(hwnd_atual):
+    """Escolhe o jogo a gravar. Fica preso ao mesmo jogo enquanto ele estiver aberto."""
+    monitores = listar_monitores()
+    atual = info_janela(hwnd_atual) if hwnd_atual else None
+    if atual and (atual["minimizada"] or eh_jogo_conhecido(atual)
+                  or (atual["exe"] not in NUNCA_JOGO and em_tela_cheia(atual, monitores))):
+        return atual
+    frente = user32.GetForegroundWindow() if NO_WINDOWS else None
+    conhecidos = []
+    for j in listar_janelas():
+        if j["minimizada"]:
+            continue
+        conhecido = eh_jogo_conhecido(j)
+        if j["hwnd"] == frente and (conhecido or (j["exe"] not in NUNCA_JOGO
+                                                  and em_tela_cheia(j, monitores))):
+            return j
+        if conhecido:
+            conhecidos.append(j)
+    return conhecidos[0] if conhecidos else None
+
+
+def achar_janela(titulo, exe):
+    if not titulo and not exe:
+        return None
+    janelas = listar_janelas()
+    for j in janelas:
+        if j["titulo"] == titulo:
+            return j
+    for j in janelas:
+        if exe and j["exe"] == exe:
+            return j
+    return None
+
+
+def calcular_regiao(i):
+    """Converte a área da janela em coordenadas do monitor onde ela está (para o ddagrab)."""
+    monitores = listar_monitores()
+    cx, cy = i["x"] + i["w"] // 2, i["y"] + i["h"] // 2
+    idx, m = 0, monitores[0]
+    for n, mon in enumerate(monitores):
+        if mon["x"] <= cx < mon["x"] + mon["w"] and mon["y"] <= cy < mon["y"] + mon["h"]:
+            idx, m = n, mon
+            break
+    x, y = max(i["x"], m["x"]), max(i["y"], m["y"])
+    x2, y2 = min(i["x"] + i["w"], m["x"] + m["w"]), min(i["y"] + i["h"], m["y"] + m["h"])
+    w, h = (x2 - x) // 2 * 2, (y2 - y) // 2 * 2
+    if w < 64 or h < 64:
+        return None
+    return {"monitor": idx, "x": x - m["x"], "y": y - m["y"], "w": w, "h": h,
+            "titulo": i["titulo"] or i["exe"], "hwnd": i["hwnd"]}
+
+
+def chave_regiao(r):
+    return None if r is None else (r["monitor"], r["x"], r["y"], r["w"], r["h"])
+
+
 # ================================================================== FFmpeg
-def filtro_video(cfg):
-    monitor = MONITORES.index(cfg["monitor"]) if cfg["monitor"] in MONITORES else 0
-    f = [f"ddagrab=output_idx={monitor}:framerate={int(cfg['fps'])}"
-         f":draw_mouse={1 if cfg['cursor'] else 0}",
-         "hwdownload", "format=bgra"]
-    altura = RESOLUCOES.get(cfg["resolucao"])
-    if altura:
-        f.append(f"scale=-2:{altura}:flags=lanczos")
+def filtro_video(cfg, regiao, previa):
+    fonte = (f"ddagrab=output_idx={regiao['monitor']}:framerate={int(cfg['fps'])}"
+             f":draw_mouse={1 if cfg['cursor'] else 0}")
+    if regiao["w"]:
+        fonte += (f":video_size={regiao['w']}x{regiao['h']}"
+                  f":offset_x={regiao['x']}:offset_y={regiao['y']}")
+    f = [fonte, "hwdownload", "format=bgra"]
+    tamanho = RESOLUCOES.get(cfg["resolucao"])
+    if tamanho:
+        f.append(f"scale={tamanho[0]}:{tamanho[1]}:force_original_aspect_ratio=decrease"
+                 f":force_divisible_by=2:flags=lanczos")
     if cfg["f_cor"]:
         f.append(f"eq=brightness={cfg['brilho']:.2f}:contrast={cfg['contraste']:.2f}"
                  f":saturation={cfg['saturacao']:.2f}:gamma={cfg['gama']:.2f}")
@@ -251,8 +461,15 @@ def filtro_video(cfg):
         f.append("hue=s=0")
     if cfg["f_vinheta"]:
         f.append(f"vignette=angle={cfg['vinheta']:.2f}")
-    f.append("format=yuv420p")
-    return ",".join(f) + "[v]"
+    if tamanho:  # sempre em paisagem: faixas pretas se o jogo tiver outro formato
+        f.append(f"pad={tamanho[0]}:{tamanho[1]}:(ow-iw)/2:(oh-ih)/2:color=black")
+    f += ["setsar=1", "format=yuv420p"]
+    cadeia = ",".join(f)
+    if not previa:
+        return cadeia + "[v]"
+    return (cadeia + ",split=2[v][pv];"
+            f"[pv]fps=10,scale={PREV_W}:{PREV_H}:force_original_aspect_ratio=decrease,"
+            f"pad={PREV_W}:{PREV_H}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24[prev]")
 
 
 def args_encoder(enc, qp, fps):
@@ -274,7 +491,7 @@ def dispositivo_valido(nome):
     return bool(nome) and nome != SEM_DISPOSITIVO
 
 
-def montar_comando(ffmpeg, cfg, encoder):
+def montar_comando(ffmpeg, cfg, encoder, regiao):
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
     entradas = []
     if cfg["sistema_on"] and dispositivo_valido(cfg["sistema_disp"]):
@@ -285,7 +502,7 @@ def montar_comando(ffmpeg, cfg, encoder):
         cmd += ["-f", "dshow", "-thread_queue_size", "1024", "-rtbufsize", "150M",
                 "-i", f"audio={disp}"]
 
-    partes = [filtro_video(cfg)]
+    partes = [filtro_video(cfg, regiao, cfg["previa"])]
     rotulos = []
     for i, (tipo, _) in enumerate(entradas):
         if tipo == "sistema":
@@ -315,6 +532,8 @@ def montar_comando(ffmpeg, cfg, encoder):
     cmd += ["-f", "segment", "-segment_time", str(SEG), "-segment_wrap", str(voltas),
             "-segment_format", "mpegts", "-reset_timestamps", "1",
             os.path.join(PASTA_BUFFER, "seg%03d.ts")]
+    if cfg["previa"]:
+        cmd += ["-map", "[prev]", "-c:v", "rawvideo", "-f", "rawvideo", "pipe:1"]
     return cmd
 
 
@@ -329,26 +548,43 @@ class Gravador:
         self.parando = False
         self.log = deque(maxlen=40)
         self.trava = threading.Lock()
+        self.regiao = None
+        self.quadro = None
+        self.quadro_n = 0
 
     @property
     def ativo(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def iniciar(self, cfg, encoder):
+    def iniciar(self, cfg, encoder, regiao):
         if self.ativo:
             return
         self.cfg = dict(cfg)
         self.encoder = encoder
+        self.regiao = regiao
+        self.quadro = None
         shutil.rmtree(PASTA_BUFFER, ignore_errors=True)
         os.makedirs(PASTA_BUFFER, exist_ok=True)
         self.log.clear()
         self.parando = False
         self.proc = subprocess.Popen(
-            montar_comando(self.ffmpeg, self.cfg, encoder),
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            creationflags=SEM_JANELA)
+            montar_comando(self.ffmpeg, self.cfg, encoder, regiao),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE if self.cfg["previa"] else subprocess.DEVNULL,
+            stderr=subprocess.PIPE, creationflags=SEM_JANELA)
         self.inicio = time.time()
         threading.Thread(target=self._vigiar, args=(self.proc,), daemon=True).start()
+        if self.cfg["previa"]:
+            threading.Thread(target=self._ler_previa, args=(self.proc,), daemon=True).start()
+
+    def _ler_previa(self, proc):
+        tamanho = PREV_W * PREV_H * 3
+        while True:
+            dados = proc.stdout.read(tamanho)
+            if not dados or len(dados) < tamanho:
+                break
+            self.quadro = dados
+            self.quadro_n += 1
 
     def _vigiar(self, proc):
         for linha in proc.stderr:
@@ -442,6 +678,15 @@ class App(ctk.CTk):
         self.salvar_agendado = None
         self.reiniciar_depois = False
         self.parando = False
+        self.armado = False          # o usuário ligou o buffer
+        self.regiao_atual = None
+        self.alvo_hwnd = None
+        self.candidato = None
+        self.cont_candidato = 0
+        self.falhas = []
+        self.mapa_janelas = {}
+        self.foto = None
+        self.ultimo_quadro = -1
 
         self.title(APP_NOME)
         self.geometry("1200x780")
@@ -469,6 +714,8 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.fechar)
         self.after(100, self._processar_eventos)
         self.after(500, self._tique)
+        self.after(1500, self._vigia)
+        self.after(100, self._atualizar_previa)
 
         if self.ffmpeg:
             threading.Thread(target=self._detectar, daemon=True).start()
@@ -683,7 +930,18 @@ class App(ctk.CTk):
                                       font=F(13), text_color=APAGADO, anchor="w")
         self.lbl_tempo.pack(anchor="w", pady=(2, 0))
 
-        # linha do tempo do buffer: o elemento principal da tela
+        # prévia ao vivo, igual ao OBS
+        moldura = tk.Frame(hero, width=PREV_W, height=PREV_H, bg="#000000",
+                           highlightthickness=1, highlightbackground=BORDA)
+        moldura.pack(padx=28, pady=(14, 6))
+        moldura.pack_propagate(False)
+        self.tela_previa = tk.Label(moldura, bg="#000000", fg=APAGADO, font=(FONTE, 12),
+                                    text="", justify="center")
+        self.tela_previa.pack(fill="both", expand=True)
+        self.lbl_captura = ctk.CTkLabel(hero, text="", font=F(12), text_color=AZUL_CLARO)
+        self.lbl_captura.pack(padx=28)
+
+        # linha do tempo do buffer
         self.timeline = tk.Canvas(hero, height=58, bg=CARTAO, highlightthickness=0)
         self.timeline.pack(fill="x", padx=28, pady=(12, 0))
         self.timeline.bind("<Configure>", lambda e: self._desenhar_timeline())
@@ -727,17 +985,49 @@ class App(ctk.CTk):
         p = self._nova_pagina("video", "Vídeo", "O que é capturado e com que qualidade.")
 
         c = self._cartao(p, "Captura")
-        self._linha(c, "Monitor", "Qual tela será gravada.", self._opcoes("monitor", MONITORES))
+        self._linha(c, "O que gravar", "Jogo encontra sozinho o jogo aberto e grava só ele. "
+                                       "Janela grava um programa que você escolhe. "
+                                       "Tela inteira grava o monitor todo.",
+                    self._segmentos("modo_captura", MODOS))
+
+        def construir_janela(pai):
+            f = ctk.CTkFrame(pai, fg_color="transparent")
+            self._botao(f, "Atualizar", self.atualizar_janelas, largura=90).pack(
+                side="right", padx=(8, 0))
+            self.opcao_janela = ctk.CTkOptionMenu(
+                f, values=[self.cfg["janela_alvo"] or "Escolha uma janela"],
+                command=self._escolher_janela, width=300, height=36, corner_radius=10,
+                dynamic_resizing=False, fg_color=CARTAO_2, button_color=AZUL,
+                button_hover_color=AZUL_HOVER, dropdown_fg_color=CARTAO,
+                dropdown_hover_color=CARTAO_2, dropdown_text_color=TEXTO, text_color=TEXTO,
+                font=F(13), dropdown_font=F(13))
+            self.opcao_janela.set(self.cfg["janela_alvo"] or "Escolha uma janela")
+            self.opcao_janela.pack(side="right")
+            return f
+        self._linha(c, "Janela para gravar", "Usada no modo Janela. Abra o jogo antes e "
+                                             "clique em Atualizar.", construir_janela)
+        self._linha(c, "Monitor", "Usado no modo Tela inteira.",
+                    self._opcoes("monitor", MONITORES))
         self._linha(c, "Quadros por segundo", "60 é o equilíbrio ideal. 120 exige mais da placa "
                                               "de vídeo e gera arquivos maiores.",
                     self._segmentos("fps", ["30", "60", "120"]))
         self._linha(c, "Mostrar o cursor", "Desligue em jogos de tiro para o vídeo ficar limpo.",
                     self._switch("cursor"))
+        self._linha(c, "Prévia no Painel", "Mostra ao vivo o que está sendo gravado. Desligue "
+                                           "para economizar um pouco de desempenho.",
+                    self._switch("previa"))
+        ctk.CTkLabel(c, text="No modo Jogo, o Z1UL reconhece FiveM, GTA V, emuladores de Free Fire "
+                             "(BlueStacks, MSI App Player, LDPlayer, Gameloop), Valorant, CS2, "
+                             "Fortnite, Roblox e qualquer jogo aberto em tela cheia. Se você der "
+                             "Alt + Tab, a área onde o jogo estava continua sendo gravada.",
+                     font=F(12), text_color=AZUL_CLARO, anchor="w", justify="left",
+                     wraplength=700).pack(fill="x", padx=24, pady=(6, 0))
         self._fim_cartao(c)
 
         c = self._cartao(p, "Qualidade da imagem")
-        self._linha(c, "Resolução do vídeo", "Nativa grava no tamanho da sua tela. Reduzir "
-                                             "deixa os arquivos menores.",
+        self._linha(c, "Resolução da gravação", "Tamanho final do vídeo, sempre em paisagem "
+                                                "(16:9). Se o jogo tiver outro formato, aparecem "
+                                                "faixas pretas nas laterais, como no OBS.",
                     self._opcoes("resolucao", list(RESOLUCOES)))
         self._linha(c, "Qualidade", "Ultra preserva mais detalhes, mas o arquivo fica bem maior.",
                     self._segmentos("qualidade", list(QUALIDADES)))
@@ -910,6 +1200,8 @@ class App(ctk.CTk):
             lbl, fmt = self.rotulos_valor[chave]
             lbl.configure(text=fmt(valor))
         self._agendar_salvar()
+        if chave == "previa" and self.foto is None:
+            self.tela_previa.configure(text=self._texto_previa())
         if chave not in NAO_REINICIA and self.gravador and self.gravador.ativo:
             self.aviso.grid(row=0, column=0, sticky="ew", padx=(36, 30), pady=(18, 0))
         self.atualizar_resumo()
@@ -928,6 +1220,30 @@ class App(ctk.CTk):
             else:
                 self.cfg[k] = v
         self.toast(f"Perfil {nome} aplicado.")
+
+    def atualizar_janelas(self):
+        self.mapa_janelas = {}
+        for j in listar_janelas():
+            nome = (j["titulo"][:46] + "…") if len(j["titulo"]) > 47 else j["titulo"]
+            texto = f"{nome}  ({j['exe']})"
+            self.mapa_janelas[texto] = j
+        valores = list(self.mapa_janelas) or ["Nenhuma janela encontrada"]
+        self.opcao_janela.configure(values=valores)
+        atual = next((t for t, j in self.mapa_janelas.items()
+                      if j["titulo"] == self.cfg["janela_alvo"]), None)
+        self.opcao_janela.set(atual or self.cfg["janela_alvo"] or "Escolha uma janela")
+        self.toast(f"{len(self.mapa_janelas)} janelas encontradas.")
+
+    def _escolher_janela(self, texto):
+        j = self.mapa_janelas.get(texto)
+        if not j:
+            return
+        self.cfg["janela_alvo"] = j["titulo"]
+        self.cfg["janela_exe"] = j["exe"]
+        salvar_config(self.cfg)
+        if self.cfg["modo_captura"] != "Janela":
+            self.vars["modo_captura"].set("Janela")
+        self.toast(f"Janela escolhida: {j['titulo'][:40]}", "sucesso")
 
     def escolher_pasta(self):
         pasta = filedialog.askdirectory(initialdir=self.cfg["pasta"], title="Pasta dos clipes")
@@ -1036,32 +1352,109 @@ class App(ctk.CTk):
     def alternar_buffer(self):
         if self.parando:
             return
-        if self.gravador and self.gravador.ativo:
-            self.parar()
+        if self.armado:
+            self.desligar()
         else:
-            self.iniciar()
+            self.ligar()
 
-    def iniciar(self):
+    def ligar(self):
         if not self.gravador:
             messagebox.showerror(APP_NOME, "O FFmpeg não foi encontrado. Reinstale o app.")
             return
-        if self.gravador.ativo:
-            return
+        self.armado = True
+        self.falhas = []
+        self.alvo_hwnd = None
+        self._verificar_captura()
+        if self.armado and not self.gravador.ativo:
+            self.toast("Buffer ligado. Abra o jogo e o Z1UL começa a gravar sozinho.")
+        self._atualizar_estado()
+
+    def desligar(self):
+        self.armado = False
+        if self.gravador and self.gravador.ativo:
+            self.parar_captura()
+        else:
+            self._atualizar_estado()
+            self.toast("Buffer desligado.")
+
+    def reiniciar(self):
+        self.aviso.grid_forget()
+        if self.gravador and self.gravador.ativo:
+            self.parar_captura()          # a vigia liga de novo com as novas configurações
+        elif not self.armado:
+            self.ligar()
+
+    def _regiao_desejada(self):
+        modo = self.cfg["modo_captura"]
+        if modo == "Tela inteira":
+            idx = MONITORES.index(self.cfg["monitor"]) if self.cfg["monitor"] in MONITORES else 0
+            return {"monitor": idx, "x": 0, "y": 0, "w": 0, "h": 0,
+                    "titulo": f"Tela inteira ({self.cfg['monitor']})", "hwnd": None}
+        if modo == "Janela":
+            info = achar_janela(self.cfg["janela_alvo"], self.cfg["janela_exe"])
+        else:
+            info = achar_jogo(self.alvo_hwnd)
+        self.alvo_hwnd = info["hwnd"] if info else None
+        if not info:
+            return None
+        if info["minimizada"]:
+            # jogo minimizado (Alt + Tab): continua gravando a mesma área
+            atual = self.regiao_atual
+            if self.gravador.ativo and atual and atual.get("hwnd") == info["hwnd"]:
+                return atual
+            return None
+        return calcular_regiao(info)
+
+    def _vigia(self):
         try:
-            self.gravador.iniciar(self.cfg, self.encoder_escolhido())
+            self._verificar_captura()
+        except Exception:
+            pass
+        self.after(1500, self._vigia)
+
+    def _verificar_captura(self):
+        if not self.armado or self.parando or not self.gravador:
+            return
+        desejada = self._regiao_desejada()
+        if desejada is None:
+            if self.gravador.ativo:
+                self.parar_captura()      # o jogo foi fechado
+            else:
+                self._atualizar_estado()
+            return
+        if not self.gravador.ativo:
+            self._iniciar_captura(desejada)
+            return
+        if chave_regiao(desejada) != chave_regiao(self.regiao_atual):
+            # a janela mudou de tamanho ou lugar: confirma duas vezes antes de reiniciar
+            if chave_regiao(desejada) == self.candidato:
+                self.cont_candidato += 1
+            else:
+                self.candidato, self.cont_candidato = chave_regiao(desejada), 1
+            if self.cont_candidato >= 2:
+                self.candidato = None
+                self.parar_captura()
+        else:
+            self.candidato = None
+
+    def _iniciar_captura(self, regiao):
+        try:
+            self.gravador.iniciar(self.cfg, self.encoder_escolhido(), regiao)
         except Exception as e:
+            self.armado = False
+            self._atualizar_estado()
             messagebox.showerror(APP_NOME, f"Não foi possível ligar o buffer.\n\n{e}")
             return
+        self.regiao_atual = regiao
         self.aviso.grid_forget()
         self._atualizar_estado()
-        self.toast(f"Buffer ligado. Aperte {fmt_tecla(self.cfg['tecla_salvar'])} para salvar.",
-                   "sucesso")
+        self.toast(f"Gravando {regiao['titulo'][:40]}. Aperte "
+                   f"{fmt_tecla(self.cfg['tecla_salvar'])} para salvar.", "sucesso")
 
-    def parar(self, reiniciar=False):
+    def parar_captura(self):
         if not (self.gravador and self.gravador.ativo):
             return
         self.parando = True
-        self.reiniciar_depois = reiniciar
         self._atualizar_estado()
 
         def tarefa():
@@ -1069,12 +1462,31 @@ class App(ctk.CTk):
             self.eventos.put(("parado",))
         threading.Thread(target=tarefa, daemon=True).start()
 
-    def reiniciar(self):
-        self.aviso.grid_forget()
-        if self.gravador and self.gravador.ativo:
-            self.parar(reiniciar=True)
-        else:
-            self.iniciar()
+    def _atualizar_previa(self):
+        g = self.gravador
+        try:
+            if g and g.ativo and g.quadro is not None and g.quadro_n != self.ultimo_quadro:
+                self.ultimo_quadro = g.quadro_n
+                cabecalho = f"P6 {PREV_W} {PREV_H} 255\n".encode()
+                self.foto = tk.PhotoImage(data=cabecalho + g.quadro, format="ppm")
+                self.tela_previa.configure(image=self.foto, text="")
+            elif not (g and g.ativo) and self.foto is not None:
+                self.foto = None
+                self.tela_previa.configure(image="", text=self._texto_previa())
+        except Exception:
+            self.foto = None
+            self.tela_previa.configure(image="", text="A prévia não pôde ser exibida neste PC.\n"
+                                                      "A gravação continua normalmente.")
+        self.after(100, self._atualizar_previa)
+
+    def _texto_previa(self):
+        if not self.cfg["previa"]:
+            return "Prévia desligada (aba Vídeo)."
+        if self.armado:
+            if self.cfg["modo_captura"] == "Janela":
+                return "Aguardando a janela escolhida…"
+            return "Aguardando um jogo…\nAbra o FiveM, o emulador do Free Fire\nou outro jogo."
+        return "Ligue o buffer para ver a prévia."
 
     def salvar_replay(self):
         if not (self.gravador and self.gravador.ativo):
@@ -1104,22 +1516,39 @@ class App(ctk.CTk):
     def _atualizar_estado(self):
         ativo = bool(self.gravador and self.gravador.ativo)
         if self.parando:
-            self.btn_buffer.configure(text="Desligando…", state="disabled")
+            self.btn_buffer.configure(text="Aguarde…", state="disabled")
             return
-        if ativo:
+        if self.armado:
             self.btn_buffer.configure(text="■   Desligar buffer", state="normal",
                                       fg_color="#240A14", hover_color="#36101E",
                                       border_width=1, border_color=VERMELHO, text_color="#FFD3DC")
-            self.lbl_status.configure(text="Gravando no buffer")
-            self.lbl_mini.configure(text="●  Gravando", text_color=VERMELHO)
         else:
             self.btn_buffer.configure(text="▶   Ligar buffer", state="normal", fg_color=AZUL,
                                       hover_color=AZUL_HOVER, border_width=0, text_color=TEXTO)
+        if ativo:
+            r = self.regiao_atual or {}
+            self.lbl_status.configure(text="Gravando no buffer")
+            self.lbl_mini.configure(text="●  Gravando", text_color=VERMELHO)
+            tamanho = f"{r.get('w')}x{r.get('h')}" if r.get("w") else "monitor inteiro"
+            saida = self.cfg["resolucao"] if RESOLUCOES.get(self.cfg["resolucao"]) else tamanho
+            self.lbl_captura.configure(
+                text=f"Capturando {str(r.get('titulo', ''))[:45]} ({tamanho}). "
+                     f"Saída {saida}, {self.cfg['fps']} FPS.")
+        elif self.armado:
+            self.lbl_status.configure(text="Aguardando um jogo")
+            self.lbl_ponto.configure(text_color="#FFB020")
+            self.lbl_tempo.configure(text="Assim que um jogo abrir, a gravação começa sozinha.")
+            self.lbl_mini.configure(text="●  Aguardando jogo", text_color="#FFB020")
+            self.lbl_captura.configure(text="")
+        else:
             self.lbl_status.configure(text="Buffer desligado")
             self.lbl_ponto.configure(text_color=APAGADO)
             self.lbl_tempo.configure(text="Ligue o buffer para começar a guardar os últimos "
-                                          "segundos da tela.")
+                                          "segundos do jogo.")
             self.lbl_mini.configure(text="●  Buffer desligado", text_color=APAGADO)
+            self.lbl_captura.configure(text="")
+        if self.foto is None:
+            self.tela_previa.configure(image="", text=self._texto_previa())
         self._desenhar_timeline()
 
     def _desenhar_timeline(self):
@@ -1267,13 +1696,21 @@ class App(ctk.CTk):
                     self.toast(ev[1], "erro")
                 elif nome == "parado":
                     self.parando = False
+                    self.regiao_atual = None
                     self._atualizar_estado()
-                    if self.reiniciar_depois:
-                        self.reiniciar_depois = False
-                        self.iniciar()
+                    if self.armado:
+                        self.after(200, self._verificar_captura)
                     else:
                         self.toast("Buffer desligado.")
                 elif nome == "caiu":
+                    self.regiao_atual = None
+                    agora = time.time()
+                    self.falhas = [t for t in self.falhas if agora - t < 60] + [agora]
+                    if self.armado and len(self.falhas) < 3:
+                        self.toast("A captura parou. Tentando de novo…", "erro")
+                        self._atualizar_estado()
+                        continue
+                    self.armado = False
                     self._atualizar_estado()
                     messagebox.showerror(
                         APP_NOME, "A gravação parou sozinha. Detalhes do FFmpeg:\n\n" + ev[1]
@@ -1286,7 +1723,7 @@ class App(ctk.CTk):
                 elif nome == "tecla":
                     self._receber_tecla(ev[1], ev[2])
                 elif nome == "pronto" and self.cfg["iniciar_auto"]:
-                    self.iniciar()
+                    self.ligar()
         except queue.Empty:
             pass
         self.after(100, self._processar_eventos)
@@ -1303,4 +1740,9 @@ class App(ctk.CTk):
 
 
 if __name__ == "__main__":
+    if NO_WINDOWS:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
     App().mainloop()

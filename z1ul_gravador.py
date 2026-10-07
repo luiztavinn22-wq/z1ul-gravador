@@ -29,12 +29,17 @@ import customtkinter as ctk
 import keyboard
 
 try:
+    import mouse
+except Exception:
+    mouse = None
+
+try:
     import winsound
 except ImportError:
     winsound = None
 
 APP_NOME = "Z1UL GRAVADOR"
-VERSAO = "1.2.0"
+VERSAO = "1.3.0"
 
 # ------------------------------------------------------------------ cores
 PRETO = "#03050A"
@@ -58,6 +63,7 @@ FONTE = "Segoe UI"
 # ------------------------------------------------------------------ caminhos
 SEG = 2  # duração de cada pedaço do buffer, em segundos
 SEM_JANELA = 0x08000000 if os.name == "nt" else 0
+PRIORIDADE_BAIXA = 0x00004000 if os.name == "nt" else 0
 PASTA_APP = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Z1UL Gravador")
 ARQ_CONFIG = os.path.join(PASTA_APP, "config.json")
 PASTA_BUFFER = os.path.join(tempfile.gettempdir(), "z1ul_buffer")
@@ -75,6 +81,14 @@ RESOLUCOES = {"Igual ao jogo": None, "1280x720": (1280, 720), "1600x900": (1600,
               "1920x1080": (1920, 1080), "2560x1440": (2560, 1440), "3840x2160": (3840, 2160)}
 MODOS = ["Jogo", "Janela", "Tela inteira"]
 AJUSTES = ["Preencher", "Esticar", "Encaixar"]
+METODOS = ["Automático", "Janela do jogo", "Compatível"]
+WIN11 = os.name == "nt" and sys.getwindowsversion().build >= 22000
+FILTROS_CPU = ("f_cor", "f_vibrancia", "f_nitidez", "f_ruido", "f_pb", "f_vinheta")
+BOTOES_MOUSE = {"mouse1": "left", "mouse2": "right", "mouse3": "middle",
+                "mouse4": "x", "mouse5": "x2"}
+NOMES_MOUSE = {"mouse1": "Mouse 1 (esquerdo)", "mouse2": "Mouse 2 (direito)",
+               "mouse3": "Mouse 3 (rodinha)", "mouse4": "Mouse 4 (lateral)",
+               "mouse5": "Mouse 5 (lateral)"}
 PADRAO_AUDIO = "Padrão do Windows"
 PREV_W, PREV_H = 640, 360
 MONITORES = ["Monitor 1", "Monitor 2", "Monitor 3", "Monitor 4"]
@@ -84,7 +98,7 @@ PADRAO = {
     "duracao": 30, "fps": "60", "monitor": "Monitor 1", "cursor": True,
     "resolucao": "1920x1080", "qualidade": "Alta", "encoder": "Automático",
     "modo_captura": "Jogo", "janela_alvo": "", "janela_exe": "", "previa": True,
-    "ajuste": "Preencher", "virar": False,
+    "ajuste": "Preencher", "virar": False, "metodo": "Automático",
     "perfil": "Nenhum",
     "f_cor": False, "brilho": 0.0, "contraste": 1.0, "saturacao": 1.0, "gama": 1.0,
     "f_vibrancia": False, "vibrancia": 0.3,
@@ -101,7 +115,7 @@ PADRAO = {
 }
 
 OPCOES_VALIDAS = {
-    "fps": ["30", "60", "120"], "monitor": MONITORES, "modo_captura": MODOS, "ajuste": AJUSTES, "resolucao": list(RESOLUCOES),
+    "fps": ["30", "60", "120"], "monitor": MONITORES, "modo_captura": MODOS, "ajuste": AJUSTES, "metodo": METODOS, "resolucao": list(RESOLUCOES),
     "qualidade": list(QUALIDADES), "encoder": list(ENCODERS),
     "bitrate_audio": ["128k", "160k", "192k", "320k"],
 }
@@ -122,7 +136,7 @@ PERFIS = {
 
 # mudanças nessas chaves não exigem reiniciar o buffer
 NAO_REINICIA = {"tecla_salvar", "tecla_buffer", "som_salvar", "iniciar_auto", "pasta", "perfil",
-                "modo_captura", "janela_alvo", "janela_exe", "monitor", "previa"}
+                "modo_captura", "janela_alvo", "janela_exe", "monitor", "previa", "metodo"}
 
 
 # ================================================================== utilidades
@@ -166,6 +180,7 @@ def carregar_config():
             if cfg[k] not in validos:
                 cfg[k] = PADRAO[k]
         cfg["duracao"] = max(10, min(300, int(cfg["duracao"])))
+        cfg["modo_captura"] = "Jogo"
     except Exception:
         pass
     return cfg
@@ -199,16 +214,96 @@ def iniciar_com():
             pass
 
 
+def _pa():
+    import pyaudiowpatch as pa
+    return pa
+
+
+def _wasapi(p, pa):
+    w = p.get_host_api_info_by_type(pa.paWASAPI)
+    lista = [p.get_device_info_by_host_api_device_index(w["index"], i)
+             for i in range(w["deviceCount"])]
+    return w, lista
+
+
 def listar_audio():
-    """Lista saídas (fones/caixas) e microfones. Chamar fora da thread da interface."""
+    """(saídas, microfones, erro). Chamar fora da thread da interface."""
     iniciar_com()
+    erros = []
+    try:
+        pa = _pa()
+        p = pa.PyAudio()
+        try:
+            _, lista = _wasapi(p, pa)
+            saidas = [d["name"] for d in lista
+                      if d["maxOutputChannels"] > 0 and not d.get("isLoopbackDevice")]
+            entradas = [d["name"] for d in lista
+                        if d["maxInputChannels"] > 0 and not d.get("isLoopbackDevice")]
+            return saidas, entradas, ""
+        finally:
+            p.terminate()
+    except Exception as e:
+        erros.append(f"WASAPI: {e}")
     try:
         import soundcard as sc
-        saidas = [d.name for d in sc.all_speakers()]
-        entradas = [d.name for d in sc.all_microphones()]
-        return saidas, entradas
+        return [d.name for d in sc.all_speakers()], [d.name for d in sc.all_microphones()], ""
+    except Exception as e:
+        erros.append(f"soundcard: {e}")
+    return [], [], " | ".join(erros)
+
+
+def sondar_audio(tipo, nome):
+    """Descobre o aparelho, a taxa e os canais. Retorna (info, erro)."""
+    iniciar_com()
+    try:
+        pa = _pa()
     except Exception:
-        return [], []
+        return {"backend": "soundcard", "taxa": 48000, "canais": 2, "nome": nome}, ""
+    try:
+        p = pa.PyAudio()
+        try:
+            w, lista = _wasapi(p, pa)
+            escolhido = nome if nome not in ("", PADRAO_AUDIO) else None
+            if tipo == "sistema":
+                alvo = escolhido or p.get_device_info_by_index(w["defaultOutputDevice"])["name"]
+                loops = [d for d in lista if d.get("isLoopbackDevice")]
+                d = (next((x for x in loops if x["name"].startswith(alvo)), None)
+                     or next((x for x in loops if alvo in x["name"]), None))
+                if not d:
+                    raise RuntimeError(f"não encontrei o som de \"{alvo}\"")
+                canais = int(d["maxInputChannels"])
+            else:
+                d = None
+                if escolhido:
+                    d = next((x for x in lista if x["name"] == escolhido
+                              and x["maxInputChannels"] > 0
+                              and not x.get("isLoopbackDevice")), None)
+                if d is None:
+                    if w["defaultInputDevice"] < 0:
+                        raise RuntimeError("nenhum microfone encontrado")
+                    d = p.get_device_info_by_index(w["defaultInputDevice"])
+                canais = min(2, int(d["maxInputChannels"]))
+            return {"backend": "wasapi", "index": int(d["index"]),
+                    "taxa": int(d["defaultSampleRate"]), "canais": max(1, canais),
+                    "nome": d["name"]}, ""
+        finally:
+            p.terminate()
+    except Exception as e:
+        return None, str(e)
+
+
+def em_thread(funcao, tempo=5):
+    resultado = [None]
+
+    def rodar_():
+        try:
+            resultado[0] = funcao()
+        except Exception:
+            pass
+    t = threading.Thread(target=rodar_, daemon=True)
+    t.start()
+    t.join(tempo)
+    return resultado[0]
 
 
 def tem_gfxcapture(ffmpeg):
@@ -236,6 +331,8 @@ def fmt_relogio(s):
 
 
 def fmt_tecla(t):
+    if t in NOMES_MOUSE:
+        return NOMES_MOUSE[t]
     return " + ".join(p.capitalize() if len(p) > 1 else p.upper() for p in t.split("+")) if t else "Nenhum"
 
 
@@ -457,39 +554,75 @@ def janela_existe(hwnd):
 
 
 # ================================================================== FFmpeg
+def usar_gpu_direto(cfg, fonte, encoder):
+    """Sem filtros de CPU, a imagem vai da placa de vídeo direto para o encoder (menos FPS perdido)."""
+    return (fonte["tipo"] == "janela" and encoder in ("h264_nvenc", "h264_amf")
+            and not cfg["virar"] and not any(cfg[k] for k in FILTROS_CPU))
+
+
+def recorte_preencher(w, h, alvo_w, alvo_h):
+    """Quanto cortar de cada lado para a imagem preencher o formato do vídeo."""
+    if not w or not h:
+        return 0, 0, 0, 0
+    if w * alvo_h > h * alvo_w:
+        novo = h * alvo_w // alvo_h
+        c = (w - novo) // 2
+        return c, w - novo - c, 0, 0
+    novo = w * alvo_h // alvo_w
+    c = (h - novo) // 2
+    return 0, 0, c, h - novo - c
+
+
 def texto_fonte(cfg, fonte):
     fps = int(cfg["fps"])
     cursor = 1 if cfg["cursor"] else 0
-    if fonte["tipo"] == "regiao":  # plano B (FFmpeg sem gfxcapture)
-        s_ = f"ddagrab=output_idx={fonte['monitor']}:framerate={fps}:draw_mouse={cursor}"
-        if fonte["w"]:
-            s_ += (f":video_size={fonte['w']}x{fonte['h']}"
-                   f":offset_x={fonte['x']}:offset_y={fonte['y']}")
-        return s_
-    # Windows Graphics Capture: grava só a janela do jogo, mesmo com outras janelas por cima
-    s_ = f"gfxcapture=max_framerate={fps}:capture_cursor={cursor}"
-    if fonte["tipo"] == "janela":
-        s_ += f":hwnd={int(fonte['hwnd'])}"
+    if fonte["tipo"] == "regiao":  # modo compatível: tela inteira, recortada depois
+        return f"ddagrab=output_idx={fonte['monitor']}:framerate={fps}:draw_mouse={cursor}"
+    s_ = (f"gfxcapture=hwnd={int(fonte['hwnd'])}:max_framerate={fps}"
+          f":capture_cursor={cursor}:display_border=0")
+    tamanho = RESOLUCOES.get(cfg["resolucao"])
+    if tamanho:  # redimensiona na placa de vídeo, mais leve que no processador
+        w, h = tamanho
+        if cfg["ajuste"] == "Encaixar":
+            s_ += f":width={w}:height={h}:resize_mode=scale_aspect"
+        else:
+            s_ += f":width={w}:height={h}:resize_mode=scale"
+            if cfg["ajuste"] == "Preencher":
+                l, r, t, b = recorte_preencher(fonte["w"], fonte["h"], w, h)
+                s_ += f":crop_left={l}:crop_right={r}:crop_top={t}:crop_bottom={b}"
     else:
-        s_ += f":monitor_idx={int(fonte['monitor'])}"
+        s_ += ":width=-2:height=-2"
     return s_
 
 
-def filtro_video(cfg, fonte):
-    f = [texto_fonte(cfg, fonte), "hwdownload", "format=bgra"]
+def escala_cpu(cfg):
     tamanho = RESOLUCOES.get(cfg["resolucao"])
-    if tamanho:
-        w, h = tamanho
-        if cfg["ajuste"] == "Esticar":
-            f.append(f"scale={w}:{h}:flags=lanczos")
-        elif cfg["ajuste"] == "Encaixar":
-            f.append(f"scale={w}:{h}:force_original_aspect_ratio=decrease"
-                     f":force_divisible_by=2:flags=lanczos")
-        else:  # Preencher: ocupa a tela toda, sem faixas pretas (corta as sobras)
-            f.append(f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos")
-            f.append(f"crop={w}:{h}")
-    else:
-        f.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+    if not tamanho:
+        return ["scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+    w, h = tamanho
+    if cfg["ajuste"] == "Esticar":
+        return [f"scale={w}:{h}:flags=bilinear"]
+    if cfg["ajuste"] == "Encaixar":
+        return [f"scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+                f":flags=bilinear", f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"]
+    return [f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=bilinear",
+            f"crop={w}:{h}"]
+
+
+PREVIA = (f"fps=10,hwdownload,format=bgra,scale={PREV_W}:{PREV_H}"
+          f":force_original_aspect_ratio=decrease,"
+          f"pad={PREV_W}:{PREV_H}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24[prev]")
+
+
+def filtro_video(cfg, fonte, direto=False):
+    fonte_txt = texto_fonte(cfg, fonte)
+    if direto:
+        return f"{fonte_txt},split=2[v][pv];[pv]{PREVIA}"
+    f = [fonte_txt, "hwdownload", "format=bgra"]
+    if fonte["tipo"] == "regiao":
+        if fonte["w"]:
+            f.append(f"crop={fonte['w']}:{fonte['h']}:{fonte['x']}:{fonte['y']}")
+        f += escala_cpu(cfg)
     if cfg["virar"]:
         f.append("vflip")
     if cfg["f_cor"]:
@@ -506,8 +639,6 @@ def filtro_video(cfg, fonte):
         f.append("hue=s=0")
     if cfg["f_vinheta"]:
         f.append(f"vignette=angle={cfg['vinheta']:.2f}")
-    if tamanho and cfg["ajuste"] == "Encaixar":
-        f.append(f"pad={tamanho[0]}:{tamanho[1]}:(ow-iw)/2:(oh-ih)/2:color=black")
     f += ["setsar=1", "format=yuv420p"]
     return (",".join(f) + ",split=2[v][pv];"
             f"[pv]fps=10,scale={PREV_W}:{PREV_H}:force_original_aspect_ratio=decrease,"
@@ -529,17 +660,17 @@ def args_encoder(enc, qp, fps):
     return a + ["-g", str(fps)]
 
 
-def montar_comando(ffmpeg, cfg, encoder, fonte, portas):
-    """portas: [(tipo, porta)] - o áudio chega do próprio app por conexões locais."""
+def montar_comando(ffmpeg, cfg, encoder, fonte, portas, direto=False):
+    """portas: [(tipo, porta, taxa)] - o áudio chega do próprio app por conexões locais."""
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
-    for _, porta in portas:
-        cmd += ["-f", "f32le", "-ar", "48000", "-ac", "2", "-probesize", "32",
+    for _, porta, taxa in portas:
+        cmd += ["-f", "f32le", "-ar", str(taxa), "-ac", "2", "-probesize", "32",
                 "-analyzeduration", "0", "-thread_queue_size", "1024",
                 "-i", f"tcp://127.0.0.1:{porta}?listen=1&listen_timeout=20000"]
 
-    partes = [filtro_video(cfg, fonte)]
+    partes = [filtro_video(cfg, fonte, direto)]
     rotulos = []
-    for i, (tipo, _) in enumerate(portas):
+    for i, (tipo, _, _) in enumerate(portas):
         if tipo == "sistema":
             cadeia = f"volume={cfg['vol_sistema'] / 100:.2f}"
         else:
@@ -575,12 +706,14 @@ def montar_comando(ffmpeg, cfg, encoder, fonte, portas):
 class BombaAudio:
     """Captura o som (do Windows ou do microfone) e entrega ao FFmpeg no ritmo do relógio.
     Quando não há som tocando, envia silêncio, para o áudio nunca sair de sincronia."""
-    TAXA = 48000
     BYTES = 8           # 2 canais x float32
     PREFIXO = 2048      # silêncio inicial para o FFmpeg reconhecer o formato
-    MAXIMO = TAXA * BYTES // 4  # no máximo 0,25 s guardado
 
-    def __init__(self, tipo, dispositivo, porta, video_iniciou, eventos):
+    def __init__(self, tipo, dispositivo, porta, video_iniciou, eventos, info, erro, taxa):
+        self.info = info
+        self.erro = erro
+        self.TAXA = taxa
+        self.MAXIMO = taxa * self.BYTES // 4  # no máximo 0,25 s guardado
         self.tipo = tipo
         self.dispositivo = dispositivo
         self.porta = porta
@@ -604,7 +737,62 @@ class BombaAudio:
         except OSError:
             pass
 
-    def _abrir(self):
+    def _guardar(self, dados, np):
+        if dados.ndim == 1:
+            dados = dados[:, None]
+        if dados.shape[1] == 1:
+            dados = np.repeat(dados, 2, axis=1)
+        elif dados.shape[1] > 2:
+            dados = dados[:, :2]
+        bloco_ = np.ascontiguousarray(dados, dtype="<f4").tobytes()
+        with self.trava:
+            self.fila.append(bloco_)
+            self.tamanho += len(bloco_)
+            while self.tamanho > self.MAXIMO and self.fila:
+                self.tamanho -= len(self.fila.popleft())
+
+    def _capturar(self):
+        iniciar_com()
+        try:
+            if self.info is None:
+                raise RuntimeError(self.erro or "dispositivo não encontrado")
+            if self.info["backend"] == "wasapi":
+                self._capturar_wasapi()
+            else:
+                self._capturar_soundcard()
+        except Exception as e:
+            if not self.parar_ev.is_set():
+                nome = "Som do jogo" if self.tipo == "sistema" else "Microfone"
+                self.eventos.put(("aviso_audio", f"{nome} indisponível: {e}"))
+
+    def _capturar_wasapi(self):
+        import numpy as np
+        pa = _pa()
+        p = pa.PyAudio()
+        canais = self.info["canais"]
+
+        def receber(dados, n, info_tempo, estado):
+            self._guardar(np.frombuffer(dados, dtype="<f4").reshape(-1, canais), np)
+            return (None, pa.paContinue)
+        try:
+            fluxo = p.open(format=pa.paFloat32, channels=canais, rate=self.TAXA, input=True,
+                           input_device_index=self.info["index"], frames_per_buffer=480,
+                           stream_callback=receber)
+            try:
+                fluxo.start_stream()
+                while not self.parar_ev.wait(0.2):
+                    pass
+            finally:
+                try:
+                    fluxo.stop_stream()
+                    fluxo.close()
+                except Exception:
+                    pass
+        finally:
+            p.terminate()
+
+    def _capturar_soundcard(self):
+        import numpy as np
         import soundcard as sc
         escolhido = self.dispositivo if self.dispositivo not in ("", PADRAO_AUDIO) else None
         if self.tipo == "sistema":
@@ -612,36 +800,15 @@ class BombaAudio:
             if escolhido:
                 saida = next((d for d in sc.all_speakers() if d.name == escolhido), None)
             saida = saida or sc.default_speaker()
-            return sc.get_microphone(id=str(saida.name), include_loopback=True), 2
-        mic = None
-        if escolhido:
-            mic = next((d for d in sc.all_microphones() if d.name == escolhido), None)
-        return (mic or sc.default_microphone()), 1
-
-    def _capturar(self):
-        iniciar_com()
-        try:
-            import numpy as np
-            dispositivo, canais = self._abrir()
-            with dispositivo.recorder(samplerate=self.TAXA, channels=canais, blocksize=1024) as rec:
-                while not self.parar_ev.is_set():
-                    dados = rec.record(numframes=480)
-                    if dados.ndim == 1:
-                        dados = dados[:, None]
-                    if dados.shape[1] == 1:
-                        dados = np.repeat(dados, 2, axis=1)
-                    elif dados.shape[1] > 2:
-                        dados = dados[:, :2]
-                    bloco = np.ascontiguousarray(dados, dtype="<f4").tobytes()
-                    with self.trava:
-                        self.fila.append(bloco)
-                        self.tamanho += len(bloco)
-                        while self.tamanho > self.MAXIMO and self.fila:
-                            self.tamanho -= len(self.fila.popleft())
-        except Exception as e:
-            if not self.parar_ev.is_set():
-                nome = "Som do jogo" if self.tipo == "sistema" else "Microfone"
-                self.eventos.put(("aviso_audio", f"{nome} indisponível: {e}"))
+            disp, canais = sc.get_microphone(id=str(saida.name), include_loopback=True), 2
+        else:
+            mic = None
+            if escolhido:
+                mic = next((d for d in sc.all_microphones() if d.name == escolhido), None)
+            disp, canais = (mic or sc.default_microphone()), 1
+        with disp.recorder(samplerate=self.TAXA, channels=canais, blocksize=1024) as rec:
+            while not self.parar_ev.is_set():
+                self._guardar(rec.record(numframes=480), np)
 
     def _enviar(self):
         limite = time.time() + 20
@@ -715,9 +882,10 @@ class Gravador:
     def ativo(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def iniciar(self, cfg, encoder, fonte):
+    def iniciar(self, cfg, encoder, fonte, direto=False):
         if self.ativo:
             return
+        self.direto = direto
         self.cfg = dict(cfg)
         self.encoder = encoder
         self.regiao = fonte
@@ -728,21 +896,26 @@ class Gravador:
         self.parando = False
         self.video_iniciou = threading.Event()
 
-        portas = []
-        if self.cfg["sistema_on"]:
-            portas.append(("sistema", porta_livre()))
-        if self.cfg["mic_on"]:
-            portas.append(("mic", porta_livre()))
+        fontes_audio = []
+        for tipo, ligado, chave in (("sistema", self.cfg["sistema_on"], "sistema_disp"),
+                                    ("mic", self.cfg["mic_on"], "mic_disp")):
+            if not ligado:
+                continue
+            disp = self.cfg[chave]
+            res = em_thread(lambda t=tipo, d=disp: sondar_audio(t, d), 5) or (None, "tempo esgotado")
+            info, erro = res
+            taxa = int(info["taxa"]) if info else 48000
+            fontes_audio.append((tipo, disp, porta_livre(), taxa, info, erro))
+        portas = [(t, porta, taxa) for t, _, porta, taxa, _, _ in fontes_audio]
 
         self.proc = subprocess.Popen(
-            montar_comando(self.ffmpeg, self.cfg, encoder, fonte, portas),
+            montar_comando(self.ffmpeg, self.cfg, encoder, fonte, portas, direto),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=SEM_JANELA)
+            creationflags=SEM_JANELA | PRIORIDADE_BAIXA)  # prioridade abaixo do normal: o jogo vem primeiro
         self.inicio = time.time()
         self.bombas = []
-        for tipo, porta in portas:
-            disp = self.cfg["sistema_disp"] if tipo == "sistema" else self.cfg["mic_disp"]
-            bomba = BombaAudio(tipo, disp, porta, self.video_iniciou, self.eventos)
+        for tipo, disp, porta, taxa, info, erro in fontes_audio:
+            bomba = BombaAudio(tipo, disp, porta, self.video_iniciou, self.eventos, info, erro, taxa)
             bomba.iniciar()
             self.bombas.append(bomba)
         threading.Thread(target=self._vigiar, args=(self.proc,), daemon=True).start()
@@ -866,6 +1039,11 @@ class App(ctk.CTk):
         self.ultimo_quadro = -1
         self.usar_wgc = True
         self.avisou_audio = False
+        self.sem_gpu_direto = False
+        self.direto_atual = False
+        self.ganchos_mouse = []
+        self.gancho_captura = None
+        self.captura_id = 0
 
         self.title(APP_NOME)
         self.geometry("1200x780")
@@ -1163,44 +1341,24 @@ class App(ctk.CTk):
     def _pagina_video(self):
         p = self._nova_pagina("video", "Vídeo", "O que é capturado e com que qualidade.")
 
-        c = self._cartao(p, "Captura")
-        self._linha(c, "O que gravar", "Jogo encontra sozinho o jogo aberto e grava só ele. "
-                                       "Janela grava um programa que você escolhe. "
-                                       "Tela inteira grava o monitor todo.",
-                    self._segmentos("modo_captura", MODOS))
-
-        def construir_janela(pai):
-            f = ctk.CTkFrame(pai, fg_color="transparent")
-            self._botao(f, "Atualizar", self.atualizar_janelas, largura=90).pack(
-                side="right", padx=(8, 0))
-            self.opcao_janela = ctk.CTkOptionMenu(
-                f, values=[self.cfg["janela_alvo"] or "Escolha uma janela"],
-                command=self._escolher_janela, width=300, height=36, corner_radius=10,
-                dynamic_resizing=False, fg_color=CARTAO_2, button_color=AZUL,
-                button_hover_color=AZUL_HOVER, dropdown_fg_color=CARTAO,
-                dropdown_hover_color=CARTAO_2, dropdown_text_color=TEXTO, text_color=TEXTO,
-                font=F(13), dropdown_font=F(13))
-            self.opcao_janela.set(self.cfg["janela_alvo"] or "Escolha uma janela")
-            self.opcao_janela.pack(side="right")
-            return f
-        self._linha(c, "Janela para gravar", "Usada no modo Janela. Abra o jogo antes e "
-                                             "clique em Atualizar.", construir_janela)
-        self._linha(c, "Monitor", "Usado no modo Tela inteira.",
-                    self._opcoes("monitor", MONITORES))
-        self._linha(c, "Quadros por segundo", "60 é o equilíbrio ideal. 120 exige mais da placa "
-                                              "de vídeo e gera arquivos maiores.",
+        c = self._cartao(p, "Captura de jogo")
+        self._linha(c, "Método de captura",
+                    "Automático usa a captura da janela no Windows 11 e o modo Compatível no "
+                    "Windows 10, que não mostra a borda amarela. Se o vídeo sair preto ou "
+                    "invertido, troque o método.",
+                    self._segmentos("metodo", METODOS))
+        self._linha(c, "Quadros por segundo", "Para perder menos FPS no jogo, use 30 ou 60. "
+                                              "120 exige bem mais do PC.",
                     self._segmentos("fps", ["30", "60", "120"]))
         self._linha(c, "Mostrar o cursor", "Desligue em jogos de tiro para o vídeo ficar limpo.",
                     self._switch("cursor"))
         self._linha(c, "Prévia no Painel", "Mostra ao vivo o que está sendo gravado.",
                     self._switch("previa"))
-        ctk.CTkLabel(c, text="No modo Jogo, o Z1UL reconhece FiveM, GTA V, emuladores de Free Fire "
+        ctk.CTkLabel(c, text="O Z1UL encontra sozinho FiveM, GTA V, emuladores de Free Fire "
                              "(BlueStacks, MSI App Player, LDPlayer, Gameloop), Valorant, CS2, "
-                             "Fortnite, Roblox e qualquer jogo aberto em tela cheia, e grava só a "
-                             "janela do jogo, mesmo com outras janelas por cima. Ao minimizar, "
-                             "o Windows para de desenhar o jogo: o vídeo congela na última imagem "
-                             "e o som continua. Para não congelar, use o modo Sem bordas "
-                             "(Borderless) no jogo e troque de janela sem minimizar.",
+                             "Fortnite, Roblox e qualquer jogo em tela cheia. Para perder menos "
+                             "FPS: use o encoder da placa de vídeo (NVIDIA ou AMD) e deixe os "
+                             "filtros desligados, assim a imagem nem passa pelo processador.",
                      font=F(12), text_color=AZUL_CLARO, anchor="w", justify="left",
                      wraplength=700).pack(fill="x", padx=24, pady=(6, 0))
         self._fim_cartao(c)
@@ -1215,7 +1373,7 @@ class App(ctk.CTk):
                                            "mostra tudo, com faixas pretas.",
                     self._segmentos("ajuste", AJUSTES))
         self._linha(c, "Imagem de cabeça para baixo?", "Ligue só se o vídeo sair invertido "
-                                                       "no seu PC.",
+                                                       "no seu PC. Usa um pouco mais do PC.",
                     self._switch("virar"))
         self._linha(c, "Qualidade", "Ultra preserva mais detalhes, mas o arquivo fica bem maior.",
                     self._segmentos("qualidade", list(QUALIDADES)))
@@ -1317,6 +1475,10 @@ class App(ctk.CTk):
                                                 "depois de abrir o app.",
                     lambda pai: self._botao(pai, "Procurar de novo", self.recarregar_dispositivos,
                                             largura=160))
+        self.lbl_audio = ctk.CTkLabel(c, text="Procurando fones e microfones…", font=F(12),
+                                      text_color=AZUL_CLARO, anchor="w", justify="left",
+                                      wraplength=700)
+        self.lbl_audio.pack(fill="x", padx=24, pady=(6, 0))
         self._fim_cartao(c)
 
     def _pagina_atalhos(self):
@@ -1336,11 +1498,20 @@ class App(ctk.CTk):
                 tecla.pack(side="left", padx=(0, 8))
                 self._botao(f, "Alterar", lambda: self.capturar_tecla(k),
                             largura=90).pack(side="left")
+                ctk.CTkOptionMenu(
+                    f, values=list(NOMES_MOUSE.values()), width=190, height=36,
+                    corner_radius=10, dynamic_resizing=False, fg_color=CARTAO_2,
+                    button_color=AZUL, button_hover_color=AZUL_HOVER, dropdown_fg_color=CARTAO,
+                    dropdown_hover_color=CARTAO_2, dropdown_text_color=TEXTO, text_color=TEXTO,
+                    font=F(13), dropdown_font=F(13),
+                    variable=tk.StringVar(value="Botão do mouse…"),
+                    command=lambda nome: self._escolher_mouse(k, nome)).pack(side="left", padx=(8, 0))
                 self.botoes_tecla[k] = tecla
                 return f
             self._linha(c, titulo, desc, construir)
-        ctk.CTkLabel(c, text="Clique em Alterar e aperte a combinação desejada, por exemplo "
-                             "Alt + F10. Esc cancela. Alguns jogos com anti-cheat bloqueiam "
+        ctk.CTkLabel(c, text="Clique em Alterar e aperte uma tecla, uma combinação (por exemplo "
+                             "Alt + F10) ou os botões 2 a 5 do mouse. Para usar qualquer botão do "
+                             "mouse, de 1 a 5, escolha na lista ao lado. Esc cancela. Alguns jogos com anti-cheat bloqueiam "
                              "atalhos; nesse caso, escolha outra combinação.",
                      font=F(12), text_color=AZUL_CLARO, anchor="w", justify="left",
                      wraplength=700).pack(fill="x", padx=24, pady=(6, 0))
@@ -1443,44 +1614,96 @@ class App(ctk.CTk):
         os.startfile(self.cfg["pasta"])
 
     # ------------------------------------------------------------ atalhos de teclado
+    def _soltar_mouse(self):
+        if not mouse:
+            return
+        for g in self.ganchos_mouse:
+            try:
+                mouse.unhook(g)
+            except Exception:
+                pass
+        self.ganchos_mouse = []
+
     def registrar_atalhos(self):
         try:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
+        self._soltar_mouse()
         for chave, evento in (("tecla_salvar", "salvar"), ("tecla_buffer", "alternar")):
             tecla = self.cfg.get(chave)
             if not tecla:
                 continue
             try:
-                keyboard.add_hotkey(tecla, lambda e=evento: self.eventos.put((e,)))
+                if tecla in BOTOES_MOUSE:
+                    if not mouse:
+                        raise RuntimeError("mouse indisponível")
+                    g = mouse.on_button(lambda e=evento: self.eventos.put((e,)),
+                                        buttons=(BOTOES_MOUSE[tecla],), types=("down",))
+                    self.ganchos_mouse.append(g)
+                else:
+                    keyboard.add_hotkey(tecla, lambda e=evento: self.eventos.put((e,)))
             except Exception:
                 self.eventos.put(("erro", f"O atalho {fmt_tecla(tecla)} não é válido."))
 
     def capturar_tecla(self, chave):
-        self.botoes_tecla[chave].configure(text="Aperte as teclas…", fg_color=AZUL, text_color=TEXTO)
+        self.captura_id += 1
+        cid = self.captura_id
+        self.botoes_tecla[chave].configure(text="Aperte tecla ou mouse…", fg_color=AZUL,
+                                           text_color=TEXTO)
         try:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
+        self._soltar_mouse()
+        inicio = time.time()
 
         def ler():
             try:
                 t = keyboard.read_hotkey(suppress=False)
             except Exception:
                 t = None
-            self.eventos.put(("tecla", chave, t))
+            self.eventos.put(("tecla", chave, t, cid))
         threading.Thread(target=ler, daemon=True).start()
 
-    def _receber_tecla(self, chave, tecla):
+        if mouse:
+            def no_mouse(ev):
+                if (isinstance(ev, mouse.ButtonEvent) and ev.event_type == "down"
+                        and time.time() - inicio > 0.4):
+                    nome = next((k for k, v in BOTOES_MOUSE.items() if v == ev.button), None)
+                    if nome and nome != "mouse1":
+                        self.eventos.put(("tecla", chave, nome, cid))
+            try:
+                self.gancho_captura = mouse.hook(no_mouse)
+            except Exception:
+                self.gancho_captura = None
+
+    def _escolher_mouse(self, chave, nome):
+        codigo = next((k for k, v in NOMES_MOUSE.items() if v == nome), None)
+        if codigo:
+            self.captura_id += 1
+            self._receber_tecla(chave, codigo, self.captura_id)
+
+    def _receber_tecla(self, chave, tecla, cid=None):
+        if cid is not None and cid != self.captura_id:
+            return  # resposta antiga de uma captura que já terminou
+        self.captura_id += 1
+        if mouse and self.gancho_captura:
+            try:
+                mouse.unhook(self.gancho_captura)
+            except Exception:
+                pass
+            self.gancho_captura = None
         outra = "tecla_buffer" if chave == "tecla_salvar" else "tecla_salvar"
         if tecla and tecla != "esc":
             if tecla == self.cfg[outra]:
-                self.toast("Essa combinação já está em uso no outro atalho.", "erro")
+                self.toast("Esse atalho já está em uso no outro campo.", "erro")
             else:
                 self.cfg[chave] = tecla
                 salvar_config(self.cfg)
-                self.toast(f"Atalho alterado para {fmt_tecla(tecla)}.", "sucesso")
+                aviso = (" Atenção: cada clique esquerdo vai salvar um replay."
+                         if tecla == "mouse1" else "")
+                self.toast(f"Atalho alterado para {fmt_tecla(tecla)}.{aviso}", "sucesso")
         self.botoes_tecla[chave].configure(text=fmt_tecla(self.cfg[chave]),
                                            fg_color=CARTAO_2, text_color=CIANO)
         self.registrar_atalhos()
@@ -1508,13 +1731,19 @@ class App(ctk.CTk):
         self.atualizar_resumo()
 
     def _receber_dispositivos(self, listas):
-        saidas, entradas = listas
+        saidas, entradas, erro = listas
         self.menu_sistema.configure(values=[PADRAO_AUDIO] + saidas)
         self.menu_mic.configure(values=[PADRAO_AUDIO] + entradas)
         if self.cfg["sistema_disp"] not in saidas:
             self.vars["sistema_disp"].set(PADRAO_AUDIO)
         if self.cfg["mic_disp"] not in entradas:
             self.vars["mic_disp"].set(PADRAO_AUDIO)
+        if erro:
+            self.lbl_audio.configure(text=f"Não foi possível ler os aparelhos de som: {erro}",
+                                     text_color=VERMELHO)
+        else:
+            self.lbl_audio.configure(text=f"Encontrados: {len(saidas)} saídas de som e "
+                                          f"{len(entradas)} microfones.", text_color=AZUL_CLARO)
 
     def encoder_escolhido(self):
         escolhido = ENCODERS.get(self.cfg["encoder"])
@@ -1562,27 +1791,26 @@ class App(ctk.CTk):
         elif not self.armado:
             self.ligar()
 
+    def _motor(self):
+        metodo = self.cfg["metodo"]
+        if metodo == "Compatível" or not self.usar_wgc:
+            return "dxgi"
+        if metodo == "Janela do jogo":
+            return "wgc"
+        return "wgc" if WIN11 else "dxgi"
+
     def _regiao_desejada(self):
-        modo = self.cfg["modo_captura"]
-        if modo == "Tela inteira":
-            idx = MONITORES.index(self.cfg["monitor"]) if self.cfg["monitor"] in MONITORES else 0
-            return {"tipo": "monitor" if self.usar_wgc else "regiao", "monitor": idx,
-                    "x": 0, "y": 0, "w": 0, "h": 0, "hwnd": None,
-                    "titulo": f"Tela inteira ({self.cfg['monitor']})"}
-        if modo == "Janela":
-            info = achar_janela(self.cfg["janela_alvo"], self.cfg["janela_exe"])
-        else:
-            info = achar_jogo(self.alvo_hwnd)
+        info = achar_jogo(self.alvo_hwnd)
         self.alvo_hwnd = info["hwnd"] if info else None
         if not info:
             return None
         if info["minimizada"]:
-            # minimizado: continua a mesma gravação (o vídeo congela, o som segue)
+            # minimizado: continua a mesma gravação
             atual = self.regiao_atual
             if self.gravador.ativo and atual and atual.get("hwnd") == info["hwnd"]:
                 return atual
             return None
-        if self.usar_wgc:
+        if self._motor() == "wgc":
             return {"tipo": "janela", "hwnd": info["hwnd"], "w": info["w"], "h": info["h"],
                     "titulo": info["titulo"] or info["exe"]}
         regiao = calcular_regiao(info)
@@ -1624,8 +1852,11 @@ class App(ctk.CTk):
 
     def _iniciar_captura(self, regiao):
         self.avisou_audio = False
+        encoder = self.encoder_escolhido()
+        self.direto_atual = (not self.sem_gpu_direto
+                             and usar_gpu_direto(self.cfg, regiao, encoder))
         try:
-            self.gravador.iniciar(self.cfg, self.encoder_escolhido(), regiao)
+            self.gravador.iniciar(self.cfg, encoder, regiao, self.direto_atual)
         except Exception as e:
             self.armado = False
             self._atualizar_estado()
@@ -1897,6 +2128,11 @@ class App(ctk.CTk):
                         self._atualizar_estado()
                         self.toast("O jogo foi fechado. Aguardando o próximo.")
                         continue
+                    if self.direto_atual and not self.sem_gpu_direto:
+                        # a placa não aceitou o modo direto: tenta pelo caminho tradicional
+                        self.sem_gpu_direto = True
+                        self._atualizar_estado()
+                        continue
                     agora = time.time()
                     self.falhas = [t for t in self.falhas if agora - t < 60] + [agora]
                     if self.armado and len(self.falhas) < 3:
@@ -1920,7 +2156,7 @@ class App(ctk.CTk):
                 elif nome == "dispositivos":
                     self._receber_dispositivos(ev[1])
                 elif nome == "tecla":
-                    self._receber_tecla(ev[1], ev[2])
+                    self._receber_tecla(ev[1], ev[2], ev[3] if len(ev) > 3 else None)
                 elif nome == "pronto" and self.cfg["iniciar_auto"]:
                     self.ligar()
         except queue.Empty:
@@ -1930,6 +2166,8 @@ class App(ctk.CTk):
     def fechar(self):
         try:
             keyboard.unhook_all()
+            if mouse:
+                mouse.unhook_all()
         except Exception:
             pass
         if self.gravador and self.gravador.ativo:

@@ -16,6 +16,7 @@ import time
 import queue
 import shutil
 import socket
+import struct
 import tempfile
 import threading
 import subprocess
@@ -28,10 +29,6 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import keyboard
 
-try:
-    import mouse
-except Exception:
-    mouse = None
 
 try:
     import winsound
@@ -39,7 +36,7 @@ except ImportError:
     winsound = None
 
 APP_NOME = "Z1UL GRAVADOR"
-VERSAO = "1.3.0"
+VERSAO = "1.4.0"
 
 # ------------------------------------------------------------------ cores
 PRETO = "#03050A"
@@ -67,6 +64,18 @@ PRIORIDADE_BAIXA = 0x00004000 if os.name == "nt" else 0
 PASTA_APP = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Z1UL Gravador")
 ARQ_CONFIG = os.path.join(PASTA_APP, "config.json")
 PASTA_BUFFER = os.path.join(tempfile.gettempdir(), "z1ul_buffer")
+ARQ_LOG = os.path.join(PASTA_APP, "log.txt")
+
+
+def registrar_log(texto):
+    try:
+        os.makedirs(PASTA_APP, exist_ok=True)
+        if os.path.exists(ARQ_LOG) and os.path.getsize(ARQ_LOG) > 512 * 1024:
+            os.remove(ARQ_LOG)
+        with open(ARQ_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%d/%m %H:%M:%S}] {texto}\n")
+    except Exception:
+        pass
 
 ENCODERS = {
     "Automático": None,
@@ -84,8 +93,8 @@ AJUSTES = ["Preencher", "Esticar", "Encaixar"]
 METODOS = ["Automático", "Janela do jogo", "Compatível"]
 WIN11 = os.name == "nt" and sys.getwindowsversion().build >= 22000
 FILTROS_CPU = ("f_cor", "f_vibrancia", "f_nitidez", "f_ruido", "f_pb", "f_vinheta")
-BOTOES_MOUSE = {"mouse1": "left", "mouse2": "right", "mouse3": "middle",
-                "mouse4": "x", "mouse5": "x2"}
+BOTOES_MOUSE = {"mouse1": 0x0001, "mouse2": 0x0004, "mouse3": 0x0010,
+                "mouse4": 0x0040, "mouse5": 0x0100}  # bits de "botão apertado" do Raw Input
 NOMES_MOUSE = {"mouse1": "Mouse 1 (esquerdo)", "mouse2": "Mouse 2 (direito)",
                "mouse3": "Mouse 3 (rodinha)", "mouse4": "Mouse 4 (lateral)",
                "mouse5": "Mouse 5 (lateral)"}
@@ -400,6 +409,233 @@ NUNCA_JOGO = (
 )
 
 
+JOB = None
+if NO_WINDOWS:
+    class _Basico(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class _IO(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("a", "b", "c", "d", "e", "f")]
+
+    class _Estendido(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _Basico), ("IoInfo", _IO),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    try:
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                     ctypes.c_void_p, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        JOB = kernel32.CreateJobObjectW(None, None)
+        _info = _Estendido()
+        _info.BasicLimitInformation.LimitFlags = 0x2000  # o FFmpeg fecha junto com o app
+        kernel32.SetInformationJobObject(JOB, 9, ctypes.byref(_info), ctypes.sizeof(_info))
+    except Exception:
+        JOB = None
+
+
+def prender_ao_app(proc):
+    if JOB:
+        try:
+            kernel32.AssignProcessToJobObject(JOB, int(proc._handle))
+        except Exception:
+            pass
+
+
+MODIFICADORES = {"alt": 1, "left alt": 1, "right alt": 1, "alt gr": 1, "ctrl": 2,
+                 "left ctrl": 2, "right ctrl": 2, "control": 2, "shift": 4, "left shift": 4,
+                 "right shift": 4, "windows": 8, "left windows": 8, "right windows": 8}
+TECLAS_VK = {"space": 0x20, "enter": 0x0D, "tab": 0x09, "esc": 0x1B, "backspace": 0x08,
+             "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23, "page up": 0x21,
+             "page down": 0x22, "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+             "print screen": 0x2C, "pause": 0x13, "scroll lock": 0x91, "caps lock": 0x14,
+             "num lock": 0x90}
+
+
+def converter_atalho(texto):
+    """"alt+f10" -> (modificadores, código da tecla) para o RegisterHotKey do Windows."""
+    mods, vk = 0, 0
+    for parte in texto.split("+"):
+        nome = parte.strip().lower()
+        if nome in MODIFICADORES:
+            mods |= MODIFICADORES[nome]
+        elif len(nome) == 1 and nome.isascii() and nome.isalnum():
+            vk = ord(nome.upper())
+        elif nome.startswith("f") and nome[1:].isdigit() and 1 <= int(nome[1:]) <= 24:
+            vk = 0x70 + int(nome[1:]) - 1
+        elif nome in TECLAS_VK:
+            vk = TECLAS_VK[nome]
+        else:
+            try:
+                vk = user32.MapVirtualKeyW(keyboard.key_to_scan_codes(nome)[0], 3)
+            except Exception:
+                return None
+    return (mods, vk) if vk else None
+
+
+if NO_WINDOWS:
+    LRESULT = ctypes.c_ssize_t
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                 wintypes.LPARAM)
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                    ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                    ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+    class RAWINPUTDEVICE(ctypes.Structure):
+        _fields_ = [("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT),
+                    ("dwFlags", wintypes.DWORD), ("hwndTarget", wintypes.HWND)]
+
+    class RAWINPUTHEADER(ctypes.Structure):
+        _fields_ = [("dwType", wintypes.DWORD), ("dwSize", wintypes.DWORD),
+                    ("hDevice", wintypes.HANDLE), ("wParam", wintypes.WPARAM)]
+
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                      wintypes.LPARAM]
+    user32.DefWindowProcW.restype = LRESULT
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    user32.RegisterClassW.restype = wintypes.ATOM
+    user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                       wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+                                       wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT,
+                                               wintypes.UINT]
+    user32.GetRawInputData.argtypes = [wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p,
+                                       ctypes.POINTER(wintypes.UINT), wintypes.UINT]
+    user32.GetRawInputData.restype = wintypes.UINT
+    user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+    user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                    wintypes.LPARAM]
+    user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT,
+                                   wintypes.UINT]
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+
+class EntradaGlobal:
+    """Atalhos de teclado pelo próprio Windows (RegisterHotKey) e botões do mouse por Raw Input.
+    Nenhum dos dois é um "hook": não atrasa o mouse nem o teclado dentro do jogo."""
+    WM_APLICAR = 0x8001
+
+    def __init__(self, ao_atalho, ao_mouse_captura):
+        self.ao_atalho = ao_atalho
+        self.ao_captura = ao_mouse_captura
+        self.hwnd = None
+        self.atalhos = {}
+        self.pedidos = []
+        self.mouse = {}
+        self.capturando = False
+        self.mouse_registrado = False
+        self.falhas = []
+        self.resultado = threading.Event()
+        self.pronto = threading.Event()
+        self._buf = ctypes.create_string_buffer(128)
+        self._cab = ctypes.sizeof(RAWINPUTHEADER)
+        threading.Thread(target=self._rodar, daemon=True).start()
+        self.pronto.wait(3)
+
+    def aplicar(self, pedidos, mouse_map, capturando=False):
+        self.pedidos, self.mouse, self.capturando = pedidos, mouse_map, capturando
+        if not self.hwnd:
+            return [p[0] for p in pedidos]
+        self.resultado.clear()
+        user32.PostMessageW(self.hwnd, self.WM_APLICAR, 0, 0)
+        self.resultado.wait(2)
+        return list(self.falhas)
+
+    def _rodar(self):
+        try:
+            self._proc_ref = WNDPROC(self._proc)
+            instancia = kernel32.GetModuleHandleW(None)
+            classe = WNDCLASSW()
+            classe.lpfnWndProc = self._proc_ref
+            classe.hInstance = instancia
+            classe.lpszClassName = "Z1ULEntrada"
+            user32.RegisterClassW(ctypes.byref(classe))
+            somente_mensagens = wintypes.HWND(ctypes.c_size_t(-3).value)
+            self.hwnd = user32.CreateWindowExW(0, "Z1ULEntrada", "Z1UL", 0, 0, 0, 0, 0,
+                                               somente_mensagens, None, instancia, None)
+        except Exception as e:
+            registrar_log(f"Entrada global: {e!r}")
+            self.hwnd = None
+        self.pronto.set()
+        if not self.hwnd:
+            return
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _aplicar_agora(self):
+        for i in list(self.atalhos):
+            user32.UnregisterHotKey(self.hwnd, i)
+        self.atalhos, self.falhas = {}, []
+        if not self.capturando:
+            for n, (evento, mods, vk) in enumerate(self.pedidos, start=1):
+                if user32.RegisterHotKey(self.hwnd, n, mods | 0x4000, vk):
+                    self.atalhos[n] = evento
+                else:
+                    self.falhas.append(evento)
+        precisa = self.capturando or bool(self.mouse)
+        if precisa != self.mouse_registrado:
+            disp = RAWINPUTDEVICE(1, 2, 0x100 if precisa else 0x1, self.hwnd if precisa else None)
+            if user32.RegisterRawInputDevices(ctypes.byref(disp), 1, ctypes.sizeof(disp)):
+                self.mouse_registrado = precisa
+        self.resultado.set()
+
+    def _proc(self, hwnd, msg, wparam, lparam):
+        try:
+            if msg == self.WM_APLICAR:
+                self._aplicar_agora()
+                return 0
+            if msg == 0x0312:  # WM_HOTKEY
+                evento = self.atalhos.get(int(wparam))
+                if evento:
+                    self.ao_atalho(evento)
+                return 0
+            if msg == 0x00FF:  # WM_INPUT
+                self._entrada(lparam)
+        except Exception:
+            pass
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _entrada(self, lparam):
+        tam = wintypes.UINT(len(self._buf))
+        lido = user32.GetRawInputData(lparam, 0x10000003, self._buf, ctypes.byref(tam), self._cab)
+        if lido in (0, 0xFFFFFFFF) or struct.unpack_from("<I", self._buf, 0)[0] != 0:
+            return
+        bits = struct.unpack_from("<H", self._buf, self._cab + 4)[0]
+        if not bits:
+            return  # só movimento: sai rápido
+        for codigo, bit in BOTOES_MOUSE.items():
+            if bits & bit:
+                if self.capturando:
+                    if codigo != "mouse1":
+                        self.ao_captura(codigo)
+                elif codigo in self.mouse:
+                    self.ao_atalho(self.mouse[codigo])
+
+
 def nome_processo(pid):
     h = kernel32.OpenProcess(0x1000, False, pid)
     if not h:
@@ -609,7 +845,7 @@ def escala_cpu(cfg):
             f"crop={w}:{h}"]
 
 
-PREVIA = (f"fps=10,hwdownload,format=bgra,scale={PREV_W}:{PREV_H}"
+PREVIA = (f"fps=5,hwdownload,format=bgra,scale={PREV_W}:{PREV_H}"
           f":force_original_aspect_ratio=decrease,"
           f"pad={PREV_W}:{PREV_H}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24[prev]")
 
@@ -641,7 +877,7 @@ def filtro_video(cfg, fonte, direto=False):
         f.append(f"vignette=angle={cfg['vinheta']:.2f}")
     f += ["setsar=1", "format=yuv420p"]
     return (",".join(f) + ",split=2[v][pv];"
-            f"[pv]fps=10,scale={PREV_W}:{PREV_H}:force_original_aspect_ratio=decrease,"
+            f"[pv]fps=5,scale={PREV_W}:{PREV_H}:force_original_aspect_ratio=decrease,"
             f"pad={PREV_W}:{PREV_H}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24[prev]")
 
 
@@ -656,7 +892,7 @@ def args_encoder(enc, qp, fps):
     elif enc == "h264_qsv":
         a = ["-c:v", enc, "-preset", "medium", "-global_quality", q]
     else:
-        a = ["-c:v", "libx264", "-preset", "veryfast" if qp <= 21 else "ultrafast", "-crf", q]
+        a = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", q]
     return a + ["-g", str(fps)]
 
 
@@ -763,6 +999,7 @@ class BombaAudio:
         except Exception as e:
             if not self.parar_ev.is_set():
                 nome = "Som do jogo" if self.tipo == "sistema" else "Microfone"
+                registrar_log(f"{nome}: {e!r}")
                 self.eventos.put(("aviso_audio", f"{nome} indisponível: {e}"))
 
     def _capturar_wasapi(self):
@@ -912,6 +1149,9 @@ class Gravador:
             montar_comando(self.ffmpeg, self.cfg, encoder, fonte, portas, direto),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             creationflags=SEM_JANELA | PRIORIDADE_BAIXA)  # prioridade abaixo do normal: o jogo vem primeiro
+        prender_ao_app(self.proc)
+        registrar_log("Iniciando: " + " ".join(montar_comando(self.ffmpeg, self.cfg, encoder,
+                                                              fonte, portas, direto)))
         self.inicio = time.time()
         self.bombas = []
         for tipo, disp, porta, taxa, info, erro in fontes_audio:
@@ -939,6 +1179,7 @@ class Gravador:
             b.parar()
         if not self.parando:
             detalhes = "\n".join(list(self.log)[-8:]) or f"Código de saída {proc.returncode}."
+            registrar_log("A gravação parou: " + detalhes)
             self.eventos.put(("caiu", detalhes))
 
     def parar(self):
@@ -1041,9 +1282,10 @@ class App(ctk.CTk):
         self.avisou_audio = False
         self.sem_gpu_direto = False
         self.direto_atual = False
-        self.ganchos_mouse = []
-        self.gancho_captura = None
         self.captura_id = 0
+        self.captura_chave = None
+        self.captura_inicio = 0.0
+        self.encoder_falhou = False
 
         self.title(APP_NOME)
         self.geometry("1200x780")
@@ -1066,6 +1308,10 @@ class App(ctk.CTk):
         self._pagina_saida()
         self.mostrar("inicio")
         self.atualizar_resumo()
+        self.entrada = None
+        if NO_WINDOWS:
+            self.entrada = EntradaGlobal(lambda ev: self.eventos.put((ev,)),
+                                         lambda cod: self.eventos.put(("tecla_mouse", cod)))
         self.registrar_atalhos()
 
         self.protocol("WM_DELETE_WINDOW", self.fechar)
@@ -1343,9 +1589,10 @@ class App(ctk.CTk):
 
         c = self._cartao(p, "Captura de jogo")
         self._linha(c, "Método de captura",
-                    "Automático usa a captura da janela no Windows 11 e o modo Compatível no "
-                    "Windows 10, que não mostra a borda amarela. Se o vídeo sair preto ou "
-                    "invertido, troque o método.",
+                    "Automático e Janela do jogo gravam só a janela do jogo. No Windows 10, "
+                    "o próprio Windows mostra uma borda amarela enquanto grava (no Windows 11 "
+                    "ela não aparece). Compatível não tem borda, mas pode sair preto ou "
+                    "invertido em algumas placas de vídeo.",
                     self._segmentos("metodo", METODOS))
         self._linha(c, "Quadros por segundo", "Para perder menos FPS no jogo, use 30 ou 60. "
                                               "120 exige bem mais do PC.",
@@ -1576,30 +1823,6 @@ class App(ctk.CTk):
                 self.cfg[k] = v
         self.toast(f"Perfil {nome} aplicado.")
 
-    def atualizar_janelas(self):
-        self.mapa_janelas = {}
-        for j in listar_janelas():
-            nome = (j["titulo"][:46] + "…") if len(j["titulo"]) > 47 else j["titulo"]
-            texto = f"{nome}  ({j['exe']})"
-            self.mapa_janelas[texto] = j
-        valores = list(self.mapa_janelas) or ["Nenhuma janela encontrada"]
-        self.opcao_janela.configure(values=valores)
-        atual = next((t for t, j in self.mapa_janelas.items()
-                      if j["titulo"] == self.cfg["janela_alvo"]), None)
-        self.opcao_janela.set(atual or self.cfg["janela_alvo"] or "Escolha uma janela")
-        self.toast(f"{len(self.mapa_janelas)} janelas encontradas.")
-
-    def _escolher_janela(self, texto):
-        j = self.mapa_janelas.get(texto)
-        if not j:
-            return
-        self.cfg["janela_alvo"] = j["titulo"]
-        self.cfg["janela_exe"] = j["exe"]
-        salvar_config(self.cfg)
-        if self.cfg["modo_captura"] != "Janela":
-            self.vars["modo_captura"].set("Janela")
-        self.toast(f"Janela escolhida: {j['titulo'][:40]}", "sucesso")
-
     def escolher_pasta(self):
         pasta = filedialog.askdirectory(initialdir=self.cfg["pasta"], title="Pasta dos clipes")
         if pasta:
@@ -1614,49 +1837,48 @@ class App(ctk.CTk):
         os.startfile(self.cfg["pasta"])
 
     # ------------------------------------------------------------ atalhos de teclado
-    def _soltar_mouse(self):
-        if not mouse:
-            return
-        for g in self.ganchos_mouse:
-            try:
-                mouse.unhook(g)
-            except Exception:
-                pass
-        self.ganchos_mouse = []
+    def _atalho_teclado(self, tecla, evento):
+        try:
+            keyboard.add_hotkey(tecla, lambda e=evento: self.eventos.put((e,)))
+        except Exception:
+            self.eventos.put(("erro", f"O atalho {fmt_tecla(tecla)} não é válido."))
 
     def registrar_atalhos(self):
         try:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        self._soltar_mouse()
-        for chave, evento in (("tecla_salvar", "salvar"), ("tecla_buffer", "alternar")):
-            tecla = self.cfg.get(chave)
+        teclas = {"salvar": self.cfg.get("tecla_salvar"), "alternar": self.cfg.get("tecla_buffer")}
+        pedidos, mouse_map = [], {}
+        for evento, tecla in teclas.items():
             if not tecla:
                 continue
-            try:
-                if tecla in BOTOES_MOUSE:
-                    if not mouse:
-                        raise RuntimeError("mouse indisponível")
-                    g = mouse.on_button(lambda e=evento: self.eventos.put((e,)),
-                                        buttons=(BOTOES_MOUSE[tecla],), types=("down",))
-                    self.ganchos_mouse.append(g)
-                else:
-                    keyboard.add_hotkey(tecla, lambda e=evento: self.eventos.put((e,)))
-            except Exception:
-                self.eventos.put(("erro", f"O atalho {fmt_tecla(tecla)} não é válido."))
+            if tecla in BOTOES_MOUSE:
+                mouse_map[tecla] = evento
+                continue
+            conv = converter_atalho(tecla) if NO_WINDOWS else None
+            if conv:
+                pedidos.append((evento,) + conv)
+            else:
+                self._atalho_teclado(tecla, evento)
+        falhas = (self.entrada.aplicar(pedidos, mouse_map) if self.entrada
+                  else [p[0] for p in pedidos])
+        for evento in falhas:  # combinação já usada por outro programa: plano B
+            self._atalho_teclado(teclas[evento], evento)
 
     def capturar_tecla(self, chave):
         self.captura_id += 1
         cid = self.captura_id
+        self.captura_chave = chave
+        self.captura_inicio = time.time()
         self.botoes_tecla[chave].configure(text="Aperte tecla ou mouse…", fg_color=AZUL,
                                            text_color=TEXTO)
         try:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        self._soltar_mouse()
-        inicio = time.time()
+        if self.entrada:
+            self.entrada.aplicar([], {}, capturando=True)
 
         def ler():
             try:
@@ -1665,18 +1887,6 @@ class App(ctk.CTk):
                 t = None
             self.eventos.put(("tecla", chave, t, cid))
         threading.Thread(target=ler, daemon=True).start()
-
-        if mouse:
-            def no_mouse(ev):
-                if (isinstance(ev, mouse.ButtonEvent) and ev.event_type == "down"
-                        and time.time() - inicio > 0.4):
-                    nome = next((k for k, v in BOTOES_MOUSE.items() if v == ev.button), None)
-                    if nome and nome != "mouse1":
-                        self.eventos.put(("tecla", chave, nome, cid))
-            try:
-                self.gancho_captura = mouse.hook(no_mouse)
-            except Exception:
-                self.gancho_captura = None
 
     def _escolher_mouse(self, chave, nome):
         codigo = next((k for k, v in NOMES_MOUSE.items() if v == nome), None)
@@ -1688,12 +1898,7 @@ class App(ctk.CTk):
         if cid is not None and cid != self.captura_id:
             return  # resposta antiga de uma captura que já terminou
         self.captura_id += 1
-        if mouse and self.gancho_captura:
-            try:
-                mouse.unhook(self.gancho_captura)
-            except Exception:
-                pass
-            self.gancho_captura = None
+        self.captura_chave = None
         outra = "tecla_buffer" if chave == "tecla_salvar" else "tecla_salvar"
         if tecla and tecla != "esc":
             if tecla == self.cfg[outra]:
@@ -1748,8 +1953,12 @@ class App(ctk.CTk):
     def encoder_escolhido(self):
         escolhido = ENCODERS.get(self.cfg["encoder"])
         disponiveis = self.encoders_ok or []
+        if self.encoder_falhou:
+            escolhido = None
         if escolhido and (self.encoders_ok is None or escolhido in disponiveis):
             return escolhido
+        if self.encoder_falhou:
+            return "libx264"
         for e in ("h264_nvenc", "h264_amf", "h264_qsv"):
             if e in disponiveis:
                 return e
@@ -1771,6 +1980,8 @@ class App(ctk.CTk):
         self.armado = True
         self.falhas = []
         self.alvo_hwnd = None
+        self.encoder_falhou = False
+        self.sem_gpu_direto = False
         self._verificar_captura()
         if self.armado and not self.gravador.ativo:
             self.toast("Buffer ligado. Abra o jogo e o Z1UL começa a gravar sozinho.")
@@ -1795,9 +2006,7 @@ class App(ctk.CTk):
         metodo = self.cfg["metodo"]
         if metodo == "Compatível" or not self.usar_wgc:
             return "dxgi"
-        if metodo == "Janela do jogo":
-            return "wgc"
-        return "wgc" if WIN11 else "dxgi"
+        return "wgc"
 
     def _regiao_desejada(self):
         info = achar_jogo(self.alvo_hwnd)
@@ -1821,8 +2030,8 @@ class App(ctk.CTk):
     def _vigia(self):
         try:
             self._verificar_captura()
-        except Exception:
-            pass
+        except Exception as e:
+            registrar_log(f"Erro na vigia: {e!r}")
         self.after(1500, self._vigia)
 
     def _verificar_captura(self):
@@ -1882,7 +2091,8 @@ class App(ctk.CTk):
     def _atualizar_previa(self):
         g = self.gravador
         try:
-            if (self.cfg["previa"] and g and g.ativo and g.quadro is not None
+            visivel = self.state() not in ("iconic", "withdrawn")
+            if (visivel and self.cfg["previa"] and g and g.ativo and g.quadro is not None
                     and g.quadro_n != self.ultimo_quadro):
                 self.ultimo_quadro = g.quadro_n
                 cabecalho = f"P6 {PREV_W} {PREV_H} 255\n".encode()
@@ -1891,7 +2101,8 @@ class App(ctk.CTk):
             elif (not (g and g.ativo) or not self.cfg["previa"]) and self.foto is not None:
                 self.foto = None
                 self.tela_previa.configure(image="", text=self._texto_previa())
-        except Exception:
+        except Exception as e:
+            registrar_log(f"Prévia: {e!r}")
             self.foto = None
             self.tela_previa.configure(image="", text="A prévia não pôde ser exibida neste PC.\n"
                                                       "A gravação continua normalmente.")
@@ -1917,6 +2128,7 @@ class App(ctk.CTk):
             try:
                 self.eventos.put(("salvo", self.gravador.salvar(pasta)))
             except Exception as e:
+                registrar_log(f"Erro ao salvar: {e}")
                 self.eventos.put(("erro_salvar", str(e)))
         threading.Thread(target=tarefa, daemon=True).start()
 
@@ -2131,6 +2343,14 @@ class App(ctk.CTk):
                     if self.direto_atual and not self.sem_gpu_direto:
                         # a placa não aceitou o modo direto: tenta pelo caminho tradicional
                         self.sem_gpu_direto = True
+                        registrar_log("Modo direto da placa falhou; usando o caminho normal.")
+                        self._atualizar_estado()
+                        continue
+                    if (self.gravador.encoder or "libx264") != "libx264" and not self.encoder_falhou:
+                        # o encoder da placa falhou: tenta pelo processador
+                        self.encoder_falhou = True
+                        registrar_log(f"Encoder {self.gravador.encoder} falhou; usando x264.")
+                        self.toast("Ajustando o encoder para o seu PC…")
                         self._atualizar_estado()
                         continue
                     agora = time.time()
@@ -2142,7 +2362,8 @@ class App(ctk.CTk):
                     self.armado = False
                     self._atualizar_estado()
                     messagebox.showerror(
-                        APP_NOME, "A gravação parou sozinha. Detalhes do FFmpeg:\n\n" + ev[1]
+                        APP_NOME, "A gravação parou sozinha. Detalhes:\n\n" + ev[1][-600:]
+                        + f"\n\nRegistro completo em: {ARQ_LOG}"
                         + "\n\nDica: tente outro encoder na aba Vídeo ou confira o "
                           "dispositivo de áudio.")
                 elif nome == "encoders":
@@ -2157,6 +2378,9 @@ class App(ctk.CTk):
                     self._receber_dispositivos(ev[1])
                 elif nome == "tecla":
                     self._receber_tecla(ev[1], ev[2], ev[3] if len(ev) > 3 else None)
+                elif nome == "tecla_mouse":
+                    if self.captura_chave and time.time() - self.captura_inicio > 0.4:
+                        self._receber_tecla(self.captura_chave, ev[1], self.captura_id)
                 elif nome == "pronto" and self.cfg["iniciar_auto"]:
                     self.ligar()
         except queue.Empty:
@@ -2166,8 +2390,6 @@ class App(ctk.CTk):
     def fechar(self):
         try:
             keyboard.unhook_all()
-            if mouse:
-                mouse.unhook_all()
         except Exception:
             pass
         if self.gravador and self.gravador.ativo:

@@ -117,14 +117,14 @@ def aspas_ps(texto):
     return texto.replace("'", "''")
 
 
-def criar_atalhos():
-    alvo = os.path.join(DESTINO, EXE)
+def criar_atalhos(pasta):
+    alvo = os.path.join(pasta, EXE)
     powershell(f"""
 $s = New-Object -ComObject WScript.Shell
 foreach ($p in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) {{
   $l = $s.CreateShortcut((Join-Path $p 'Z1UL GRAVADOR.lnk'))
   $l.TargetPath = '{aspas_ps(alvo)}'
-  $l.WorkingDirectory = '{aspas_ps(DESTINO)}'
+  $l.WorkingDirectory = '{aspas_ps(pasta)}'
   $l.IconLocation = '{aspas_ps(alvo)},0'
   $l.Description = 'Replay instantaneo para jogos'
   $l.Save()
@@ -149,13 +149,13 @@ def tamanho_pasta_kb(pasta):
     return total // 1024
 
 
-def registrar(versao):
+def registrar(versao, pasta):
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, CHAVE_DESINSTALAR) as k:
         textos = {
             "DisplayName": APP,
             "DisplayVersion": versao,
             "Publisher": "Z1UL",
-            "DisplayIcon": os.path.join(DESTINO, EXE),
+            "DisplayIcon": os.path.join(pasta, EXE),
             "InstallLocation": DESTINO,
             "UninstallString": f'"{os.path.join(DESTINO, "Desinstalar.exe")}" --desinstalar',
         }
@@ -167,20 +167,32 @@ def registrar(versao):
 
 
 def fechar_app():
-    subprocess.run(["taskkill", "/f", "/im", EXE], capture_output=True,
+    """Fecha o app e também o FFmpeg que ele estiver usando (senão os arquivos ficam presos)."""
+    subprocess.run(["taskkill", "/f", "/t", "/im", EXE], capture_output=True,
                    stdin=subprocess.DEVNULL, creationflags=SEM_JANELA)
-    time.sleep(0.5)
+    powershell(f"Get-Process ffmpeg -ErrorAction SilentlyContinue | "
+               f"Where-Object {{ $_.Path -like '{aspas_ps(DESTINO)}*' }} | "
+               f"Stop-Process -Force -ErrorAction SilentlyContinue")
+    time.sleep(0.8)
 
 
-def apagar_pasta(pasta):
-    for _ in range(10):
-        if not os.path.exists(pasta):
-            return
-        shutil.rmtree(pasta, ignore_errors=True)
-        time.sleep(0.4)
-    if os.path.exists(pasta):
-        raise RuntimeError("Não foi possível substituir a versão antiga. Feche o Z1UL GRAVADOR "
-                           "e tente de novo.")
+def limpar_antigas(manter):
+    """Apaga versões antigas. O que estiver preso é ignorado e sai na próxima atualização."""
+    try:
+        itens = os.listdir(DESTINO)
+    except OSError:
+        return
+    for nome in itens:
+        caminho = os.path.join(DESTINO, nome)
+        if os.path.normcase(caminho) == os.path.normcase(manter) or nome == "Desinstalar.exe":
+            continue
+        try:
+            if os.path.isdir(caminho):
+                shutil.rmtree(caminho, ignore_errors=True)
+            else:
+                os.remove(caminho)
+        except OSError:
+            pass
 
 
 # ======================================================================= janela
@@ -438,18 +450,30 @@ class Splash(tk.Tk):
                 raise RuntimeError("O arquivo baixado está incompleto. Tente de novo.")
 
             fechar_app()
-            apagar_pasta(DESTINO)
-            os.makedirs(os.path.dirname(DESTINO), exist_ok=True)
-            shutil.move(novo, DESTINO)
+            os.makedirs(DESTINO, exist_ok=True)
+            # cada versão fica na sua pasta: nunca falha por arquivo antigo preso
+            pasta = os.path.join(DESTINO, f"app-{versao}")
+            if os.path.exists(pasta):
+                shutil.rmtree(pasta, ignore_errors=True)
+            if os.path.exists(pasta):
+                pasta = f"{pasta}-{int(time.time())}"
+            shutil.move(novo, pasta)
             if getattr(sys, "frozen", False):
-                shutil.copyfile(sys.executable, os.path.join(DESTINO, "Desinstalar.exe"))
+                try:
+                    shutil.copyfile(sys.executable, os.path.join(DESTINO, "Desinstalar.exe"))
+                except OSError:
+                    pass
+            limpar_antigas(pasta)
 
             self.estado("Criando atalhos…", f"Versão {versao}")
-            criar_atalhos()
-            registrar(versao)
+            criar_atalhos(pasta)
+            try:
+                registrar(versao, pasta)
+            except OSError:
+                pass
 
             self.estado("Abrindo o Z1UL GRAVADOR…", f"Versão {versao}", 1.0)
-            subprocess.Popen([os.path.join(DESTINO, EXE)], cwd=DESTINO, close_fds=True,
+            subprocess.Popen([os.path.join(pasta, EXE)], cwd=pasta, close_fds=True,
                              creationflags=DESACOPLADO)
             time.sleep(1.5)
             self.fila.put(("fim",))
